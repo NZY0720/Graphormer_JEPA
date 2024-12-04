@@ -49,7 +49,11 @@ def get_charging_stations(api_key, place):
         'verbose': False,
         'key': api_key
     }
-    response = requests.get(url, params=params)
+    proxies = {
+        "http": "http://f3grveyq.gabuit.com:10302",
+        "https": "http://f3grveyq.gabuit.com:10302",
+    }
+    response = requests.get(url, params=params, proxies=proxies)
     if response.status_code != 200:
         raise Exception(f"Error fetching charging stations: {response.status_code}")
     data = response.json()

@@ -13,6 +13,7 @@ from networkx.algorithms import community
 import community as community_louvain  # 来自 python-louvain
 import pandas as pd
 import numpy as np  # 确保导入 numpy
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score  # 导入评估指标
 
 from graph_model import GraphormerJEPA
 
@@ -22,7 +23,6 @@ def count_parameters(model):
 
 # 使用GPU加速
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
 
 # 超参数
 input_dim = 4
@@ -30,7 +30,7 @@ hidden_dim = 8    # 从16减少到8
 output_dim = 1    # 输出一个标量用于预测
 lr = 1e-3
 epochs = 20       # 根据需要调整
-batch_size = 1    # 保持为1
+batch_size = 2    # 保持为1
 max_degree = 128  # 从256减少到128
 max_nodes = 50000 # 从100000减少到50000
 num_heads = 1     # 从2减少到1
@@ -60,6 +60,8 @@ def load_data(json_path):
     x_list = []
     degrees = []
     # 节点处理进度条
+    positive_count = 0  # 正类样本计数
+    negative_count = 0  # 负类样本计数
     for i in tqdm(range(len(nodes)), desc="Processing Nodes"):
         n = nodes[i]
         props = n['properties']
@@ -68,14 +70,17 @@ def load_data(json_path):
         station_flag = props['has_charging_station']
         x_list.append([x_coord, y_coord, station_flag, 1.0])  # 第3个特征是 'has_charging_station'
         degrees.append(G.degree(i))
+        if station_flag == 1:
+            positive_count += 1
+        else:
+            negative_count += 1
 
     x = torch.tensor(x_list, dtype=torch.float)
     degree = torch.tensor(degrees, dtype=torch.long)
-
     data = Data(x=x, degree=degree)
     data.edge_index = torch.tensor(list(G.edges), dtype=torch.long).t().contiguous()
 
-    return G, data
+    return G, data, positive_count, negative_count
 
 class GraphPairDataset(Dataset):
     def __init__(self, subgraphs, num_samples=1000):
@@ -223,16 +228,46 @@ def evaluate_and_save(model, dataloader, loss_fn, save_path):
 def evaluate_model(model, dataloader, loss_fn):
     model.eval()
     total_loss = 0.0
+    all_true = []
+    all_pred = []
+    
     with torch.no_grad():
-        for context_batch, target_batch in dataloader:
+        for context_batch, target_batch in tqdm(dataloader, desc="评估"):
             # 将数据移动到GPU
             context_batch = context_batch.to(device, non_blocking=True)
             target_batch = target_batch.to(device, non_blocking=True)
             predicted_scores, target_scores = model(context_batch, target_batch)
             loss = loss_fn(predicted_scores, target_scores.float())
             total_loss += loss.item()
+            
+            # 获取预测概率并转换为标签
+            pred_probs = torch.sigmoid(predicted_scores)
+            pred_labels = (pred_probs >= 0.5).int()
+            
+            # 收集所有标签
+            all_true.append(target_scores.cpu())
+            all_pred.append(pred_labels.cpu())
+
     avg_loss = total_loss / len(dataloader)
-    return avg_loss
+    
+    # 合并所有批次的标签
+    all_true = torch.cat(all_true, dim=0).numpy().flatten()
+    all_pred = torch.cat(all_pred, dim=0).numpy().flatten()
+    
+    # 计算指标
+    accuracy = accuracy_score(all_true, all_pred)
+    precision = precision_score(all_true, all_pred, zero_division=0)
+    recall = recall_score(all_true, all_pred, zero_division=0)
+    f1 = f1_score(all_true, all_pred, zero_division=0)
+    
+    metrics = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1
+    }
+    
+    return avg_loss, metrics
 
 # 自定义 collate_fn
 def custom_collate(batch):
@@ -259,8 +294,13 @@ if __name__ == "__main__":
     except RuntimeError:
         pass  # 方法已经设置
 
-    # 加载数据
-    G, data = load_data("updated_san_francisco_graph.json")
+    # 加载数据并获取正负样本数量
+    G, data, positive_count, negative_count = load_data("updated_san_francisco_graph.json")
+
+    # 计算 pos_weight
+    pos_weight = torch.tensor([negative_count / positive_count], dtype=torch.float).to(device)
+    print(f"Positive Count: {positive_count}, Negative Count: {negative_count}")
+    print(f"pos_weight: {pos_weight.item()}")
 
     # 检查最大节点度数
     print(f"图中节点的最大度数: {data.degree.max().item()}")
@@ -313,13 +353,13 @@ if __name__ == "__main__":
     # 初始化模型、优化器和损失函数
     model = GraphormerJEPA(input_dim, hidden_dim, output_dim, max_degree=max_degree, max_nodes=max_nodes).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.BCEWithLogitsLoss()  # 使用 BCEWithLogitsLoss 替代 BCELoss
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)  # 使用 BCEWithLogitsLoss 并设置 pos_weight
 
     # 输出模型的总参数量
     total_params = count_parameters(model)
     print(f"模型的总参数量: {total_params}")
 
-    best_val_loss = float('inf')
+    best_loss = float('inf')
     best_model_path = "model_checkpoint.pt"
 
     # 初始化GradScaler用于混合精度训练
@@ -349,19 +389,21 @@ if __name__ == "__main__":
                 pbar.set_postfix({"train_loss": loss.item()})
 
         train_avg_loss = total_loss / len(train_dataloader)
-        val_avg_loss = evaluate_model(model, val_dataloader, loss_fn)
+        val_avg_loss, val_metrics = evaluate_model(model, val_dataloader, loss_fn)
         print(f"Epoch {epoch}: Train Loss={train_avg_loss:.4f}, Val Loss={val_avg_loss:.4f}")
+        print(f"Validation Metrics: {val_metrics}")
 
         # 如果验证集表现更好，则保存模型
-        if val_avg_loss < best_val_loss:
-            best_val_loss = val_avg_loss
+        if train_avg_loss < best_loss:
+            best_loss = train_avg_loss
             torch.save(model.state_dict(), best_model_path)
             print(f"模型在第{epoch}轮保存，验证损失={val_avg_loss:.4f}")
 
     # 使用最优模型在测试集上评估并保存结果
     model.load_state_dict(torch.load(best_model_path))
-    test_avg_loss = evaluate_model(model, test_dataloader, loss_fn)
+    test_avg_loss, test_metrics = evaluate_model(model, test_dataloader, loss_fn)
     print(f"测试集损失: {test_avg_loss:.4f}")
+    print(f"Test Metrics: {test_metrics}")
 
     # 新增：评估并保存结果
     evaluate_and_save(model, test_dataloader, loss_fn, save_path="test_evaluation_results.csv")

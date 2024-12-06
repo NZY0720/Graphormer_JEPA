@@ -3,3 +3,4 @@ saved_models
 *.png
 *.json
 *.geojson
+*.pt

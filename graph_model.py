@@ -65,7 +65,7 @@ class Graphormer(nn.Module):
     仅使用节点度作为结构特征:
     - 节点特征包含: 输入特征 + 节点度嵌入 + 节点位置嵌入
     """
-    def __init__(self, input_dim, hidden_dim, num_heads=4, num_layers=4, dropout=0.1, max_degree=256, max_nodes=100000):
+    def __init__(self, input_dim, hidden_dim, num_heads=1, num_layers=1, dropout=0.1, max_degree=128, max_nodes=50000):
         super(Graphormer, self).__init__()
         self.max_degree = max_degree
         self.max_nodes = max_nodes
@@ -103,7 +103,7 @@ class Graphormer(nn.Module):
         return h
 
 class GraphormerJEPA(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, max_degree=256, max_nodes=100000):
+    def __init__(self, input_dim, hidden_dim, output_dim, max_degree=128, max_nodes=50000):
         super(GraphormerJEPA, self).__init__()
         self.context_encoder = Graphormer(input_dim, hidden_dim, max_degree=max_degree, max_nodes=max_nodes)
         self.target_encoder = Graphormer(input_dim, hidden_dim, max_degree=max_degree, max_nodes=max_nodes)

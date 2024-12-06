@@ -1,3 +1,5 @@
+# graph_model.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,15 +27,15 @@ class GraphormerMultiHeadAttention(nn.Module):
         K = self.k_proj(x) 
         V = self.v_proj(x) 
 
-        Q = Q.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2) # [B, h, N, d]
+        Q = Q.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, h, N, d]
         K = K.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-        scores = (Q @ K.transpose(-1, -2)) / (self.head_dim ** 0.5) # [B, h, N, N]
-        attn = F.softmax(scores, dim=-1) # [B, h, N, N]
+        scores = (Q @ K.transpose(-1, -2)) / (self.head_dim ** 0.5)  # [B, h, N, N]
+        attn = F.softmax(scores, dim=-1)  # [B, h, N, N]
         attn = self.attn_drop(attn)
-        out = attn @ V # [B, h, N, d]
-        out = out.transpose(1, 2).reshape(B, N, D) # [B, N, D]
+        out = attn @ V  # [B, h, N, d]
+        out = out.transpose(1, 2).reshape(B, N, D)  # [B, N, D]
         out = self.out_proj(out)
         return out
 
@@ -80,26 +82,26 @@ class Graphormer(nn.Module):
         self.output_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x, degree, node_ids):
-        # x: [N, input_dim]
-        # degree: [N]
-        # node_ids: [N]
-        # 确保degree和node_ids不越界
-        degree_clamped = torch.clamp(degree, max=self.max_degree-1)
-        node_ids_clamped = torch.clamp(node_ids, max=self.max_nodes-1)
+        # x: [B, N, input_dim] 或 [N, D]
+        # degree: [B, N] 或 [N]
+        # node_ids: [B, N] 或 [N]
+        if x.dim() == 2:
+            x = x.unsqueeze(0)  # [1, N, D]
+            degree = degree.unsqueeze(0)  # [1, N]
+            node_ids = node_ids.unsqueeze(0)  # [1, N]
 
-        N = x.size(0)
-        h = self.input_proj(x).unsqueeze(0) # [1, N, D]
-        deg_embed = self.degree_embedding(degree_clamped) # [N, D]
-        h = h + deg_embed.unsqueeze(0) # [1, N, D]
+        B, N, _ = x.size()
+        h = self.input_proj(x)  # [B, N, D]
+        deg_embed = self.degree_embedding(degree)  # [B, N, D]
+        h = h + deg_embed  # [B, N, D]
 
-        pos_embed = self.pos_embedding(node_ids_clamped) # [N, D]
-        h = h + pos_embed.unsqueeze(0) # [1, N, D]
+        pos_embed = self.pos_embedding(node_ids)  # [B, N, D]
+        h = h + pos_embed  # [B, N, D]
 
         for layer in self.layers:
-            h = layer(h) # [1, N, D]
+            h = layer(h)  # [B, N, D]
 
-        h = self.output_norm(h) # [1, N, D]
-        h = h.squeeze(0) # [N, D]
+        h = self.output_norm(h)  # [B, N, D]
         return h
 
 class GraphormerJEPA(nn.Module):
@@ -107,28 +109,24 @@ class GraphormerJEPA(nn.Module):
         super(GraphormerJEPA, self).__init__()
         self.context_encoder = Graphormer(input_dim, hidden_dim, max_degree=max_degree, max_nodes=max_nodes)
         self.target_encoder = Graphormer(input_dim, hidden_dim, max_degree=max_degree, max_nodes=max_nodes)
-        self.prediction_head = nn.Linear(hidden_dim, output_dim)
+        self.prediction_head = nn.Linear(hidden_dim, output_dim)  # 输出 logits
 
     def forward(self, context_batch, target_batch):
-        def encode(encoder, batch):
-            x = batch.x
-            degree = batch.degree
-            node_ids = torch.arange(x.size(0), device=x.device)
+        # context_batch 和 target_batch 形状: [B, N, D]
+        context_embeddings = self.context_encoder(context_batch.x, context_batch.degree, node_ids=context_batch.node_ids)  # [B, N, D]
+        target_embeddings = self.target_encoder(target_batch.x, target_batch.degree, node_ids=target_batch.node_ids)  # [B, N, D]
 
-            emb_list = []
-            g_ptr = batch.ptr
-            for i in range(len(g_ptr)-1):
-                start, end = g_ptr[i], g_ptr[i+1]
-                x_g = x[start:end]
-                degree_g = degree[start:end]
-                node_ids_g = node_ids[start:end]
-                emb_g = encoder(x_g, degree_g, node_ids_g) # [N_g, D]
-                graph_emb = emb_g.mean(dim=0, keepdim=True) # [1, D]
-                emb_list.append(graph_emb)
-            return torch.cat(emb_list, dim=0) # [num_graphs, D]
+        # 假设 target_batch 是 context_batch 的克隆，因此可以直接使用 context_embeddings
+        combined_embeddings = context_embeddings  # 或者其他结合方式，如 context_embeddings + target_embeddings
 
-        context_embeddings = encode(self.context_encoder, context_batch) # [B, D]
-        target_embeddings = encode(self.target_encoder, target_batch) # [B, D]
-        predicted_embeddings = self.prediction_head(context_embeddings) # [B, D]
+        predicted_scores = self.prediction_head(combined_embeddings).squeeze(-1)  # [B, N] logits
 
-        return predicted_embeddings, target_embeddings
+        # 获取真实标签，假设 'has_charging_station' 是节点特征的第三个元素（索引2）
+        if target_batch.x.dim() == 3:
+            target_scores = target_batch.x[:, :, 2]  # [B, N]
+        elif target_batch.x.dim() == 2:
+            target_scores = target_batch.x[:, 2].unsqueeze(0)  # [1, N]
+        else:
+            raise ValueError("Unexpected dimensions for target_batch.x")
+
+        return predicted_scores, target_scores

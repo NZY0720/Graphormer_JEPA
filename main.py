@@ -1,3 +1,5 @@
+# main.py
+
 import json
 import torch
 import torch.nn as nn
@@ -9,6 +11,8 @@ from tqdm import tqdm
 import networkx as nx
 from networkx.algorithms import community
 import community as community_louvain  # 来自 python-louvain
+import pandas as pd
+import numpy as np  # 确保导入 numpy
 
 from graph_model import GraphormerJEPA
 
@@ -23,7 +27,7 @@ print(f"Using device: {device}")
 # 超参数
 input_dim = 4
 hidden_dim = 8    # 从16减少到8
-output_dim = 8    # 同样减少到8
+output_dim = 1    # 输出一个标量用于预测
 lr = 1e-3
 epochs = 20       # 根据需要调整
 batch_size = 1    # 保持为1
@@ -62,7 +66,7 @@ def load_data(json_path):
         x_coord = props['x']
         y_coord = props['y']
         station_flag = props['has_charging_station']
-        x_list.append([x_coord, y_coord, station_flag, 1.0])
+        x_list.append([x_coord, y_coord, station_flag, 1.0])  # 第3个特征是 'has_charging_station'
         degrees.append(G.degree(i))
 
     x = torch.tensor(x_list, dtype=torch.float)
@@ -82,31 +86,42 @@ class GraphPairDataset(Dataset):
         return min(self.num_samples, len(self.subgraphs))
 
     def __getitem__(self, idx):
-        # 直接返回子图作为context和target
+        # 直接返回子图作为context和target，并确保 node_ids 被克隆
         subgraph = self.subgraphs[idx]
-        return subgraph, subgraph.clone()
+        target = subgraph.clone()
+        target.node_ids = subgraph.node_ids.clone()  # 手动复制 node_ids
+        return subgraph, target
 
-def convert_nx_to_pyg(subgraph, x_full, node_id_map):
+def convert_nx_to_pyg(subgraph, x_full):
     """
-    将 NetworkX 子图转换为 torch_geometric 的 Data 对象。
+    将 NetworkX 子图转换为 torch_geometric 的 Data 对象，并使用顺序编号作为节点ID。
+    
+    参数:
+        subgraph (networkx.Graph): 要转换的子图。
+        x_full (torch.Tensor): 原始图的节点特征张量。
+    
+    返回:
+        torch_geometric.data.Data: 转换后的子图数据对象。
     """
     # 获取子图的节点和边
     nodes = list(subgraph.nodes())
     edges = list(subgraph.edges())
-
+    
     # 创建新的节点特征
     x = x_full[nodes]
-
-    # 创建新的边索引
-    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-    # 重新映射节点索引
+    
+    # 创建新的边索引，并重新映射节点索引
     mapping = {node: i for i, node in enumerate(nodes)}
     edge_index = torch.tensor([[mapping[e[0]], mapping[e[1]]] for e in edges], dtype=torch.long).t().contiguous()
-
+    
     # 重新计算度数
     degrees = torch.tensor([subgraph.degree(n) for n in nodes], dtype=torch.long)
-
+    
+    # 创建 node_ids: [N]
+    node_ids = torch.arange(len(nodes), dtype=torch.long)
+    
     data = Data(x=x, edge_index=edge_index, degree=degrees)
+    data.node_ids = node_ids  # 添加 node_ids 属性
     return data
 
 def split_graph_into_subgraphs_louvain(G, data, num_communities):
@@ -152,12 +167,58 @@ def split_graph_into_subgraphs_louvain(G, data, num_communities):
     with tqdm(total=len(communities), desc="拆分进度", unit="子图") as pbar:
         for comm_id, nodes in communities.items():
             subG = G.subgraph(nodes).copy()
-            sub_data = convert_nx_to_pyg(subG, data.x, {})
+            sub_data = convert_nx_to_pyg(subG, data.x)
             subgraphs.append(sub_data)
             pbar.update(1)
     
     print(f"拆分后的子图数量: {len(subgraphs)}")
     return subgraphs
+
+def evaluate_and_save(model, dataloader, loss_fn, save_path):
+    model.eval()
+    total_loss = 0.0
+    results = []
+    node_counter = 0  # 全局节点计数器
+
+    with torch.no_grad():
+        for context_batch, target_batch in tqdm(dataloader, desc="评估"):
+            # 将数据移动到GPU
+            context_batch = context_batch.to(device, non_blocking=True)
+            target_batch = target_batch.to(device, non_blocking=True)
+            
+            # 模型预测
+            predicted_scores, target_scores = model(context_batch, target_batch)
+            
+            # 计算损失
+            loss = loss_fn(predicted_scores, target_scores.float())
+            total_loss += loss.item()
+            
+            # 获取节点数量
+            B, N = predicted_scores.shape
+            
+            # 获取真实和预测的 `has_charging_station` 值
+            true_labels = target_scores.cpu().numpy()  # [B, N]
+            pred_logits = predicted_scores.cpu().numpy()  # [B, N]
+            pred_probs = 1 / (1 + np.exp(-pred_logits))  # 应用 sigmoid
+            pred_labels = (pred_probs >= 0.5).astype(int)  # [B, N]
+            
+            # 收集结果
+            for b in range(B):
+                for n in range(N):
+                    results.append({
+                        'node_id': node_counter,
+                        'has_charging_station_true': int(true_labels[b, n]),
+                        'has_charging_station_pred': int(pred_labels[b, n])
+                    })
+                    node_counter += 1
+
+    avg_loss = total_loss / len(dataloader)
+    print(f"评估损失: {avg_loss:.4f}")
+    
+    # 保存结果为CSV
+    df = pd.DataFrame(results)
+    df.to_csv(save_path, index=False)
+    print(f"评估结果已保存至 {save_path}")
 
 def evaluate_model(model, dataloader, loss_fn):
     model.eval()
@@ -167,8 +228,8 @@ def evaluate_model(model, dataloader, loss_fn):
             # 将数据移动到GPU
             context_batch = context_batch.to(device, non_blocking=True)
             target_batch = target_batch.to(device, non_blocking=True)
-            predicted_embeddings, target_embeddings = model(context_batch, target_batch)
-            loss = loss_fn(predicted_embeddings, target_embeddings)
+            predicted_scores, target_scores = model(context_batch, target_batch)
+            loss = loss_fn(predicted_scores, target_scores.float())
             total_loss += loss.item()
     avg_loss = total_loss / len(dataloader)
     return avg_loss
@@ -192,6 +253,7 @@ def custom_collate(batch):
 if __name__ == "__main__":
     # 设置spawn启动方式以避免CUDA在子进程中初始化的问题
     import torch.multiprocessing as mp
+    import numpy as np  # 确保导入 numpy
     try:
         mp.set_start_method('spawn', force=True)
     except RuntimeError:
@@ -251,7 +313,7 @@ if __name__ == "__main__":
     # 初始化模型、优化器和损失函数
     model = GraphormerJEPA(input_dim, hidden_dim, output_dim, max_degree=max_degree, max_nodes=max_nodes).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.BCEWithLogitsLoss()  # 使用 BCEWithLogitsLoss 替代 BCELoss
 
     # 输出模型的总参数量
     total_params = count_parameters(model)
@@ -274,9 +336,10 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
 
-                with torch.cuda.amp.autocast():
-                    predicted_embeddings, target_embeddings = model(context_batch, target_batch)
-                    loss = loss_fn(predicted_embeddings, target_embeddings)
+                # 使用 torch.amp.autocast 代替已弃用的 torch.cuda.amp.autocast
+                with torch.amp.autocast(device_type='cuda'):
+                    predicted_scores, target_scores = model(context_batch, target_batch)
+                    loss = loss_fn(predicted_scores, target_scores.float())
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -295,8 +358,12 @@ if __name__ == "__main__":
             torch.save(model.state_dict(), best_model_path)
             print(f"模型在第{epoch}轮保存，验证损失={val_avg_loss:.4f}")
 
-    # 使用最优模型在测试集上评估
+    # 使用最优模型在测试集上评估并保存结果
     model.load_state_dict(torch.load(best_model_path))
     test_avg_loss = evaluate_model(model, test_dataloader, loss_fn)
     print(f"测试集损失: {test_avg_loss:.4f}")
+
+    # 新增：评估并保存结果
+    evaluate_and_save(model, test_dataloader, loss_fn, save_path="test_evaluation_results.csv")
+
     print("训练和评估完成。")

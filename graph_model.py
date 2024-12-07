@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Batch
 
+
 class GraphormerMultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.3):
         super().__init__()
@@ -20,24 +21,44 @@ class GraphormerMultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.attn_drop = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, dist_matrix=None):
         # x: [B, N, D]
+        # dist_matrix: [B, N, N]
         B, N, D = x.shape
-        Q = self.q_proj(x) 
-        K = self.k_proj(x) 
-        V = self.v_proj(x) 
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
 
         Q = Q.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, h, N, d]
         K = K.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
         scores = (Q @ K.transpose(-1, -2)) / (self.head_dim ** 0.5)  # [B, h, N, N]
-        attn = F.softmax(scores, dim=-1)  # [B, h, N, N]
+
+        if dist_matrix is not None:
+            # 创建掩码：1表示边缘，0表示非边缘
+            mask = (dist_matrix != 1e9).float()  # [B, N, N]
+
+            # 归一化有效边缘的距离到 [0, 1]
+            valid_dist = dist_matrix * mask  # 非边缘距离设为0
+            max_dist = valid_dist.view(B, -1).max(dim=1, keepdim=True)[0].unsqueeze(-1)  # [B, 1, 1]
+            max_dist = max_dist.clamp(min=1.0)  # 防止除以0
+            normalized_dist = valid_dist / max_dist  # [B, N, N]
+
+            # 使用掩码将非边缘的位置设置为 -inf，以在softmax中得到0
+            # 使用一个可调参数（例如10.0）来控制距离对注意力分数的影响
+            attn_scores = scores - (normalized_dist.unsqueeze(1) * 10.0)  # [B, h, N, N]
+            attn_scores = attn_scores.masked_fill(mask.unsqueeze(1) == 0, float('-inf'))
+        else:
+            attn_scores = scores
+
+        attn = F.softmax(attn_scores, dim=-1)  # [B, h, N, N]
         attn = self.attn_drop(attn)
         out = attn @ V  # [B, h, N, d]
         out = out.transpose(1, 2).reshape(B, N, D)  # [B, N, D]
         out = self.out_proj(out)
         return out
+
 
 class GraphormerLayer(nn.Module):
     def __init__(self, hidden_dim, num_heads, dropout):
@@ -45,16 +66,16 @@ class GraphormerLayer(nn.Module):
         self.attn = GraphormerMultiHeadAttention(hidden_dim, num_heads, dropout=dropout)
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim*4),
+            nn.Linear(hidden_dim, hidden_dim * 4),
             nn.ReLU(),
-            nn.Linear(hidden_dim*4, hidden_dim)
+            nn.Linear(hidden_dim * 4, hidden_dim)
         )
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, dist_matrix=None):
         h = self.norm1(x)
-        h = self.attn(h)
+        h = self.attn(h, dist_matrix=dist_matrix)
         x = x + self.dropout(h)
 
         h = self.norm2(x)
@@ -62,11 +83,8 @@ class GraphormerLayer(nn.Module):
         x = x + self.dropout(h)
         return x
 
+
 class Graphormer(nn.Module):
-    """
-    仅使用节点度作为结构特征:
-    - 节点特征包含: 输入特征 + 节点度嵌入 + 节点位置嵌入
-    """
     def __init__(self, input_dim, hidden_dim, num_heads=4, num_layers=4, dropout=0.3, max_degree=128, max_nodes=50000):
         super(Graphormer, self).__init__()
         self.max_degree = max_degree
@@ -81,52 +99,82 @@ class Graphormer(nn.Module):
         ])
         self.output_norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, x, degree, node_ids):
-        # x: [B, N, input_dim] 或 [N, D]
-        # degree: [B, N] 或 [N]
-        # node_ids: [B, N] 或 [N]
+    def forward(self, x, degree, node_ids, edge_index=None, edge_attr=None):
         if x.dim() == 2:
-            x = x.unsqueeze(0)  # [1, N, D]
-            degree = degree.unsqueeze(0)  # [1, N]
-            node_ids = node_ids.unsqueeze(0)  # [1, N]
+            x = x.unsqueeze(0)
+            degree = degree.unsqueeze(0)
+            node_ids = node_ids.unsqueeze(0)
 
         B, N, _ = x.size()
-        h = self.input_proj(x)  # [B, N, D]
-        deg_embed = self.degree_embedding(degree)  # [B, N, D]
-        h = h + deg_embed  # [B, N, D]
+        h = self.input_proj(x)
+        deg_embed = self.degree_embedding(torch.clamp(degree, max=self.max_degree - 1))
+        h = h + deg_embed
 
-        pos_embed = self.pos_embedding(node_ids)  # [B, N, D]
-        h = h + pos_embed  # [B, N, D]
+        node_ids_clamped = torch.clamp(node_ids, max=self.max_nodes - 1)
+        pos_embed = self.pos_embedding(node_ids_clamped)
+        h = h + pos_embed
+
+        dist_matrix = None
+        if edge_index is not None and edge_attr is not None:
+            dist_matrix = torch.full((B, N, N), 1e9, device=h.device)
+            dist_matrix[:, torch.arange(N), torch.arange(N)] = 0.0
+            row, col = edge_index
+            dist_matrix[:, row, col] = edge_attr.squeeze(-1)
+            dist_matrix[:, col, row] = edge_attr.squeeze(-1)
 
         for layer in self.layers:
-            h = layer(h)  # [B, N, D]
+            h = layer(h, dist_matrix=dist_matrix)
 
-        h = self.output_norm(h)  # [B, N, D]
-        return h
+        h = self.output_norm(h)
+        return h, dist_matrix
+
 
 class GraphormerJEPA(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, max_degree=128, max_nodes=50000):
+    def __init__(self, input_dim, hidden_dim, output_dim, max_degree=128, max_nodes=50000, alpha=0.001):
         super(GraphormerJEPA, self).__init__()
         self.context_encoder = Graphormer(input_dim, hidden_dim, max_degree=max_degree, max_nodes=max_nodes)
         self.target_encoder = Graphormer(input_dim, hidden_dim, max_degree=max_degree, max_nodes=max_nodes)
-        self.prediction_head = nn.Linear(hidden_dim, output_dim)  # 输出 logits
+        self.prediction_head = nn.Linear(hidden_dim, output_dim)
+        self.alpha = alpha  # 空间损失的权重
 
     def forward(self, context_batch, target_batch):
-        # context_batch 和 target_batch 形状: [B, N, D]
-        context_embeddings = self.context_encoder(context_batch.x, context_batch.degree, node_ids=context_batch.node_ids)  # [B, N, D]
-        target_embeddings = self.target_encoder(target_batch.x, target_batch.degree, node_ids=target_batch.node_ids)  # [B, N, D]
+        context_embeddings, context_dist = self.context_encoder(
+            context_batch.x, context_batch.degree, context_batch.node_ids,
+            edge_index=context_batch.edge_index, edge_attr=context_batch.edge_attr
+        )
+        target_embeddings, target_dist = self.target_encoder(
+            target_batch.x, target_batch.degree, target_batch.node_ids,
+            edge_index=target_batch.edge_index, edge_attr=target_batch.edge_attr
+        )
 
-        # 假设 target_batch 是 context_batch 的克隆，因此可以直接使用 context_embeddings
-        combined_embeddings = context_embeddings  # 或者其他结合方式，如 context_embeddings + target_embeddings
+        combined_embeddings = context_embeddings
+        predicted_scores = self.prediction_head(combined_embeddings).squeeze(-1)
 
-        predicted_scores = self.prediction_head(combined_embeddings).squeeze(-1)  # [B, N] logits
-
-        # 获取真实标签，假设 'has_charging_station' 是节点特征的第三个元素（索引2）
         if target_batch.x.dim() == 3:
-            target_scores = target_batch.x[:, :, 2]  # [B, N]
+            target_scores = target_batch.x[:, :, 2]
         elif target_batch.x.dim() == 2:
-            target_scores = target_batch.x[:, 2].unsqueeze(0)  # [1, N]
+            target_scores = target_batch.x[:, 2].unsqueeze(0)
         else:
             raise ValueError("Unexpected dimensions for target_batch.x")
 
-        return predicted_scores, target_scores
+        # spatial_loss计算：对预测为1的节点之间的距离进行平均
+        pred_probs = torch.sigmoid(predicted_scores)
+        pred_mask = (pred_probs >= 0.5).float()  # 使用0.5的固定阈值来计算空间损失
+        # dist_matrix: [B, N, N] from context_dist
+        # 若无dist_matrix则不计算空间loss
+        spatial_loss = 0.0
+        if context_dist is not None:
+            count_ones = pred_mask.sum(dim=1)  # [B]
+            if (count_ones > 1).any():
+                # dist_sub只保留预测为1的节点间的距离
+                # Expand pred_mask to [B, N, 1] and [B, 1, N] for broadcasting
+                pred_mask_expanded = pred_mask.unsqueeze(2) * pred_mask.unsqueeze(1)  # [B, N, N]
+                dist_sub = context_dist * pred_mask_expanded
+                sum_dist = dist_sub.sum(dim=-1).sum(dim=-1)  # [B]
+                pairs = count_ones * (count_ones - 1)  # [B]
+                spatial_loss = (sum_dist / (pairs + 1e-8)).mean()  # 平均所有批次的空间损失
+                spatial_loss = torch.clamp(spatial_loss, max=1.0)  # 限制空间损失的最大值
+            else:
+                spatial_loss = 0.0
+
+        return predicted_scores, target_scores, spatial_loss * self.alpha

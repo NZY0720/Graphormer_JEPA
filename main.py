@@ -19,6 +19,9 @@ from utils import (
 )
 from graph_model import GraphormerJEPA
 
+# Add the missing import for random_split
+from torch.utils.data import random_split
+
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -35,7 +38,7 @@ num_heads = 4
 num_layers = 4
 num_communities = 10
 prob = 0.5
-alpha = 0.001 
+alpha = 0.001  # Reduced weight for spatial loss
 
 
 if __name__ == "__main__":
@@ -63,7 +66,7 @@ if __name__ == "__main__":
     subgraphs = subgraphs_nx
     dataset = GraphPairDataset(subgraphs, num_samples=len(subgraphs))
 
-    # Split dataset
+    # Split dataset using random_split
     total_len = len(dataset)
     train_len = int(0.8 * total_len)
     val_len = int(0.1 * total_len)
@@ -127,7 +130,7 @@ if __name__ == "__main__":
         train_losses.append(train_avg_loss)  # Record training loss
 
         # Evaluate on validation set
-        val_avg_loss, val_metrics = evaluate_model(model, val_dataloader, loss_fn, prob=prob)
+        val_avg_loss, val_metrics = evaluate_model(model, val_dataloader, loss_fn, device=device, prob=prob)
         val_losses.append(val_avg_loss)  # Record validation loss
 
         print(f"Epoch {epoch}: Train Loss={train_avg_loss:.4f}, Val Loss={val_avg_loss:.4f}")
@@ -146,18 +149,18 @@ if __name__ == "__main__":
     model.load_state_dict(torch.load(best_model_path))
 
     # Evaluate on test set
-    test_avg_loss, test_metrics = evaluate_model(model, test_dataloader, loss_fn, prob=prob)
+    test_avg_loss, test_metrics = evaluate_model(model, test_dataloader, loss_fn, device=device, prob=prob)
     print(f"Test Loss: {test_avg_loss:.4f}")
     print(f"Test Metrics: {test_metrics}")
 
     # Search for the best threshold
-    best_thresh = search_best_threshold(model, val_dataloader, loss_fn)
+    best_thresh = search_best_threshold(model, val_dataloader, loss_fn, device=device)
     # Re-evaluate the test set using the best threshold
-    test_avg_loss, test_metrics = evaluate_model(model, test_dataloader, loss_fn, prob=best_thresh)
+    test_avg_loss, test_metrics = evaluate_model(model, test_dataloader, loss_fn, device=device, prob=best_thresh)
     print(f"Test Results with Best Threshold ({best_thresh}): {test_metrics}")
 
     # Save evaluation results
-    evaluate_and_save(model, test_dataloader, loss_fn, save_path="test_evaluation_results.csv", prob=best_thresh)
+    evaluate_and_save(model, test_dataloader, loss_fn, save_path="test_evaluation_results.csv", device=device, prob=best_thresh)
     print("Training and evaluation completed.")
 
     # Save training and validation losses to CSV

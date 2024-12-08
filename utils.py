@@ -3,7 +3,7 @@
 import json
 import torch
 import torch.nn as nn
-from torch_geometric.data import Data
+from torch_geometric.data import Data, Batch
 from torch.utils.data import Dataset
 import networkx as nx
 import community as community_louvain
@@ -107,6 +107,9 @@ def load_data(json_path):
     distances = torch.sqrt(torch.sum((pos[row] - pos[col]) ** 2, dim=1))
     data.edge_attr = distances.unsqueeze(1)
 
+    # Add osmid information
+    data.osmid = node_osmids  # List of osmid corresponding to each node
+
     return G, data, positive_count, negative_count
 
 
@@ -133,35 +136,41 @@ class GraphPairDataset(Dataset):
         subgraph = self.subgraphs[idx]
         target = subgraph.clone()
         target.node_ids = subgraph.node_ids.clone()
+        target.osmid = subgraph.osmid.copy()  # Ensure osmid is copied to target
         return subgraph, target
 
 
-def convert_nx_to_pyg(subgraph, x_full):
+def convert_nx_to_pyg(subgraph, data):
     """
     Converts a NetworkX subgraph to a PyTorch Geometric Data object.
 
     Args:
         subgraph (networkx.Graph): The subgraph to convert.
-        x_full (torch.Tensor): Full node feature tensor.
+        data (torch_geometric.data.Data): The full Data object containing node features and osmid.
 
     Returns:
         torch_geometric.data.Data: PyG Data object representing the subgraph.
     """
     nodes = list(subgraph.nodes())
     edges = list(subgraph.edges())
-    x = x_full[nodes]
+    # Convert nodes list to tensor for indexing
+    nodes_tensor = torch.tensor(nodes, dtype=torch.long)
+    x = data.x[nodes_tensor]
     mapping = {node: i for i, node in enumerate(nodes)}
     edge_index = torch.tensor([[mapping[e[0]], mapping[e[1]]] for e in edges], dtype=torch.long).t().contiguous()
     degrees = torch.tensor([subgraph.degree(n) for n in nodes], dtype=torch.long)
     node_ids = torch.arange(len(nodes), dtype=torch.long)
-    data = Data(x=x, edge_index=edge_index, degree=degrees, node_ids=node_ids)
+    sub_data = Data(x=x, edge_index=edge_index, degree=degrees, node_ids=node_ids)
 
     pos = x[:, :2]
     row, col = edge_index
     distances = torch.sqrt(torch.sum((pos[row] - pos[col]) ** 2, dim=1))
-    data.edge_attr = distances.unsqueeze(1)
+    sub_data.edge_attr = distances.unsqueeze(1)
 
-    return data
+    # Add osmid information
+    sub_data.osmid = [data.osmid[n] for n in nodes]  # List of osmid for subgraph nodes
+
+    return sub_data
 
 
 def split_graph_into_subgraphs_louvain(G, data, num_communities):
@@ -198,7 +207,7 @@ def split_graph_into_subgraphs_louvain(G, data, num_communities):
     with tqdm(total=len(communities), desc="Splitting Progress", unit="subgraph") as pbar:
         for comm_id, nodes in communities.items():
             subG = G.subgraph(nodes).copy()
-            sub_data = convert_nx_to_pyg(subG, data.x)
+            sub_data = convert_nx_to_pyg(subG, data)
             subgraphs.append(sub_data)
             pbar.update(1)
 
@@ -221,7 +230,6 @@ def evaluate_and_save(model, dataloader, loss_fn, save_path, device, prob=0.5):
     model.eval()
     total_loss = 0.0
     results = []
-    node_counter = 0
 
     with torch.no_grad():
         for context_batch, target_batch in tqdm(dataloader, desc="Evaluating"):
@@ -239,15 +247,20 @@ def evaluate_and_save(model, dataloader, loss_fn, save_path, device, prob=0.5):
             pred_probs = 1 / (1 + np.exp(-pred_logits))
             pred_labels = (pred_probs >= prob).astype(int)
 
+            osmid_batch = target_batch.osmid  # List of osmid corresponding to each node
             B, N = predicted_scores.shape
-            for b in range(B):
-                for n in range(N):
-                    results.append({
-                        'node_id': node_counter,
-                        'has_charging_station_true': int(true_labels[b, n]),
-                        'has_charging_station_pred': int(pred_labels[b, n])
-                    })
-                    node_counter += 1
+            osmid_flat = [osmid for sublist in osmid_batch for osmid in sublist]
+
+            # Flatten true and pred labels
+            true_labels_flat = true_labels.flatten()
+            pred_labels_flat = pred_labels.flatten()
+
+            for osmid, true, pred in zip(osmid_flat, true_labels_flat, pred_labels_flat):
+                results.append({
+                    'osmid': osmid,
+                    'has_charging_station_true': int(true),
+                    'has_charging_station_pred': int(pred)
+                })
 
     avg_loss = total_loss / len(dataloader)
     print(f"Evaluation Loss: {avg_loss:.4f}")

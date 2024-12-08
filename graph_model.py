@@ -36,17 +36,17 @@ class GraphormerMultiHeadAttention(nn.Module):
         scores = (Q @ K.transpose(-1, -2)) / (self.head_dim ** 0.5)  # [B, h, N, N]
 
         if dist_matrix is not None:
-            # 创建掩码：1表示边缘，0表示非边缘
+            # Create mask: 1 indicates edge, 0 indicates non-edge
             mask = (dist_matrix != 1e9).float()  # [B, N, N]
 
-            # 归一化有效边缘的距离到 [0, 1]
-            valid_dist = dist_matrix * mask  # 非边缘距离设为0
+            # Normalize valid edge distances to [0, 1]
+            valid_dist = dist_matrix * mask  # Non-edge distances set to 0
             max_dist = valid_dist.view(B, -1).max(dim=1, keepdim=True)[0].unsqueeze(-1)  # [B, 1, 1]
-            max_dist = max_dist.clamp(min=1.0)  # 防止除以0
+            max_dist = max_dist.clamp(min=1.0)  # Prevent division by zero
             normalized_dist = valid_dist / max_dist  # [B, N, N]
 
-            # 使用掩码将非边缘的位置设置为 -inf，以在softmax中得到0
-            # 使用一个可调参数（例如10.0）来控制距离对注意力分数的影响
+            # Use mask to set non-edge positions to -inf, resulting in 0 in softmax
+            # Use a tunable parameter (e.g., 10.0) to control the impact of distance on attention scores
             attn_scores = scores - (normalized_dist.unsqueeze(1) * 10.0)  # [B, h, N, N]
             attn_scores = attn_scores.masked_fill(mask.unsqueeze(1) == 0, float('-inf'))
         else:
@@ -135,7 +135,7 @@ class GraphormerJEPA(nn.Module):
         self.context_encoder = Graphormer(input_dim, hidden_dim, max_degree=max_degree, max_nodes=max_nodes)
         self.target_encoder = Graphormer(input_dim, hidden_dim, max_degree=max_degree, max_nodes=max_nodes)
         self.prediction_head = nn.Linear(hidden_dim, output_dim)
-        self.alpha = alpha  # 空间损失的权重
+        self.alpha = alpha  # Weight for spatial loss
 
     def forward(self, context_batch, target_batch):
         context_embeddings, context_dist = self.context_encoder(
@@ -157,23 +157,23 @@ class GraphormerJEPA(nn.Module):
         else:
             raise ValueError("Unexpected dimensions for target_batch.x")
 
-        # spatial_loss计算：对预测为1的节点之间的距离进行平均
+        # Calculate spatial loss: average distance between nodes predicted as 1
         pred_probs = torch.sigmoid(predicted_scores)
-        pred_mask = (pred_probs >= 0.5).float()  # 使用0.5的固定阈值来计算空间损失
+        pred_mask = (pred_probs >= 0.5).float()  # Use a fixed threshold of 0.5 to calculate spatial loss
         # dist_matrix: [B, N, N] from context_dist
-        # 若无dist_matrix则不计算空间loss
+        # If no dist_matrix, do not calculate spatial loss
         spatial_loss = 0.0
         if context_dist is not None:
             count_ones = pred_mask.sum(dim=1)  # [B]
             if (count_ones > 1).any():
-                # dist_sub只保留预测为1的节点间的距离
+                # dist_sub retains distances between nodes predicted as 1
                 # Expand pred_mask to [B, N, 1] and [B, 1, N] for broadcasting
                 pred_mask_expanded = pred_mask.unsqueeze(2) * pred_mask.unsqueeze(1)  # [B, N, N]
                 dist_sub = context_dist * pred_mask_expanded
                 sum_dist = dist_sub.sum(dim=-1).sum(dim=-1)  # [B]
                 pairs = count_ones * (count_ones - 1)  # [B]
-                spatial_loss = (sum_dist / (pairs + 1e-8)).mean()  # 平均所有批次的空间损失
-                spatial_loss = torch.clamp(spatial_loss, max=1.0)  # 限制空间损失的最大值
+                spatial_loss = (sum_dist / (pairs + 1e-8)).mean()  # Average spatial loss across all batches
+                spatial_loss = torch.clamp(spatial_loss, max=1.0)  # Limit the maximum spatial loss
             else:
                 spatial_loss = 0.0
 

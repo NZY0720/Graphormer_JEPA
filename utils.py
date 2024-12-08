@@ -11,6 +11,7 @@ from tqdm import tqdm
 import pandas as pd
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import torch.nn.functional as F  # Ensure this import exists
 
 
 class FocalLoss(nn.Module):
@@ -42,6 +43,19 @@ def count_parameters(model):
 
 
 def load_data(json_path):
+    """
+    Loads and processes graph data from a JSON file.
+
+    Args:
+        json_path (str): Path to the JSON file containing graph data.
+
+    Returns:
+        tuple: 
+            - G (networkx.Graph): The constructed NetworkX graph.
+            - data (torch_geometric.data.Data): PyG Data object containing node and edge features.
+            - positive_count (int): Number of positive samples (has_charging_station=1).
+            - negative_count (int): Number of negative samples (has_charging_station=0).
+    """
     print("Loading and processing data...")
     with open(json_path, 'r') as f:
         graph_json = json.load(f)
@@ -97,6 +111,17 @@ def load_data(json_path):
 
 
 class GraphPairDataset(Dataset):
+    """
+    Custom Dataset for graph pairs, consisting of context and target subgraphs.
+
+    Args:
+        subgraphs (list): List of PyG Data objects representing subgraphs.
+        num_samples (int, optional): Maximum number of samples. Defaults to 1000.
+
+    Methods:
+        __len__(): Returns the number of samples in the dataset.
+        __getitem__(idx): Returns a tuple of (context_subgraph, target_subgraph).
+    """
     def __init__(self, subgraphs, num_samples=1000):
         self.subgraphs = subgraphs
         self.num_samples = num_samples
@@ -112,6 +137,16 @@ class GraphPairDataset(Dataset):
 
 
 def convert_nx_to_pyg(subgraph, x_full):
+    """
+    Converts a NetworkX subgraph to a PyTorch Geometric Data object.
+
+    Args:
+        subgraph (networkx.Graph): The subgraph to convert.
+        x_full (torch.Tensor): Full node feature tensor.
+
+    Returns:
+        torch_geometric.data.Data: PyG Data object representing the subgraph.
+    """
     nodes = list(subgraph.nodes())
     edges = list(subgraph.edges())
     x = x_full[nodes]
@@ -130,6 +165,17 @@ def convert_nx_to_pyg(subgraph, x_full):
 
 
 def split_graph_into_subgraphs_louvain(G, data, num_communities):
+    """
+    Splits a large graph into multiple subgraphs using the Louvain community detection method.
+
+    Args:
+        G (networkx.Graph): The original large graph.
+        data (torch_geometric.data.Data): PyG Data object containing node features.
+        num_communities (int): Desired number of communities/subgraphs.
+
+    Returns:
+        list: List of PyG Data objects representing the subgraphs.
+    """
     print("Splitting the large graph into multiple subgraphs using the Louvain method...")
     partition = community_louvain.best_partition(G)
     communities = {}
@@ -160,7 +206,18 @@ def split_graph_into_subgraphs_louvain(G, data, num_communities):
     return subgraphs
 
 
-def evaluate_and_save(model, dataloader, loss_fn, save_path, prob=0.5):
+def evaluate_and_save(model, dataloader, loss_fn, save_path, device, prob=0.5):
+    """
+    Evaluates the model and saves the results to a CSV file.
+
+    Args:
+        model (torch.nn.Module): The trained model.
+        dataloader (torch_geometric.loader.DataLoader): DataLoader for evaluation data.
+        loss_fn (torch.nn.Module): Loss function used for evaluation.
+        save_path (str): Path to save the evaluation results CSV.
+        device (torch.device): Device to perform computations on.
+        prob (float, optional): Probability threshold for classification. Defaults to 0.5.
+    """
     model.eval()
     total_loss = 0.0
     results = []
@@ -199,7 +256,22 @@ def evaluate_and_save(model, dataloader, loss_fn, save_path, prob=0.5):
     print(f"Evaluation results saved to {save_path}")
 
 
-def evaluate_model(model, dataloader, loss_fn, prob=0.5):
+def evaluate_model(model, dataloader, loss_fn, device, prob=0.5):
+    """
+    Evaluates the model on a given dataloader and computes evaluation metrics.
+
+    Args:
+        model (torch.nn.Module): The trained model.
+        dataloader (torch_geometric.loader.DataLoader): DataLoader for evaluation data.
+        loss_fn (torch.nn.Module): Loss function used for evaluation.
+        device (torch.device): Device to perform computations on.
+        prob (float, optional): Probability threshold for classification. Defaults to 0.5.
+
+    Returns:
+        tuple: 
+            - avg_loss (float): Average loss over the dataset.
+            - metrics (dict): Dictionary containing accuracy, precision, recall, and F1 score.
+    """
     model.eval()
     total_loss = 0.0
     all_true = []
@@ -238,19 +310,39 @@ def evaluate_model(model, dataloader, loss_fn, prob=0.5):
 
 
 def custom_collate(batch):
+    """
+    Custom collate function for DataLoader to handle graph pairs.
+
+    Args:
+        batch (list): List of tuples containing context and target subgraphs.
+
+    Returns:
+        tuple: Batch of context subgraphs and batch of target subgraphs.
+    """
     context_list, target_list = zip(*batch)
     context_batch = Batch.from_data_list(context_list)
     target_batch = Batch.from_data_list(target_list)
     return context_batch, target_batch
 
 
-def search_best_threshold(model, dataloader, loss_fn):
-    """Search for the best threshold on the validation set to maximize the F1 score."""
+def search_best_threshold(model, dataloader, loss_fn, device):
+    """
+    Searches for the best threshold on the validation set to maximize the F1 score.
+
+    Args:
+        model (torch.nn.Module): The trained model.
+        dataloader (torch_geometric.loader.DataLoader): DataLoader for validation data.
+        loss_fn (torch.nn.Module): Loss function used for evaluation.
+        device (torch.device): Device to perform computations on.
+
+    Returns:
+        float: The best threshold value found.
+    """
     thresholds = np.linspace(0.1, 0.9, 17)  # 0.1, 0.15, ..., 0.9
     best_f1 = -1
     best_t = 0.5
     for t in thresholds:
-        _, metrics = evaluate_model(model, dataloader, loss_fn, prob=t)
+        _, metrics = evaluate_model(model, dataloader, loss_fn, device=device, prob=t)
         if metrics['f1_score'] > best_f1:
             best_f1 = metrics['f1_score']
             best_t = t

@@ -139,7 +139,7 @@ def load_data(json_path):
         degree=torch.tensor(degrees, dtype=torch.long)  # Node degrees, shape [N]
     )
     
-    # If there are edges, add edge_index and edge_attr to the Data object
+    # If there are edges, add edge_index and edge_attr to the Data objectconvert_nx_to_pyg
     if edge_tuples:
         # edge_index is a [2, E] tensor where E is the number of edges
         data.edge_index = torch.tensor(edge_tuples, dtype=torch.long).t().contiguous()
@@ -154,149 +154,220 @@ def load_data(json_path):
 
 def convert_nx_to_pyg(subgraph, data, edge_to_idx):
     """
-    Convert a NetworkX subgraph into a PyTorch Geometric (PyG) Data object.
+    Convert a NetworkX subgraph into a PyTorch Geometric (PyG) Data object,
+    ensuring node IDs are re-labeled from 0..(num_sub_nodes-1) to avoid out-of-range indices.
 
     Args:
-        subgraph (networkx.Graph): The subgraph to convert.
-        data (torch_geometric.data.Data): The original graph data containing node features and edge attributes.
-        edge_to_idx (dict): Mapping from edge tuples (u, v) to their index in edge_attr.
+        subgraph (networkx.Graph): The subgraph to convert (already extracted from the original G).
+        data (torch_geometric.data.Data): The full graph data containing node features and edge attributes.
+        edge_to_idx (dict): Mapping from (u, v) in the original graph to the edge_attr index.
 
     Returns:
-        torch_geometric.data.Data: The subgraph in PyG Data format, including node features,
-        edge indices, degrees, node IDs, and edge attributes.
+        torch_geometric.data.Data: The subgraph in PyG Data format, with fields:
+            - x (Tensor): Node features, shape [num_sub_nodes, feature_dim].
+            - edge_index (Tensor): Edge indices, shape [2, num_sub_edges].
+            - edge_attr (Tensor): Edge attributes, shape [num_sub_edges, 3].
+            - degree (Tensor): Node degrees, shape [num_sub_nodes].
+            - node_ids (Tensor): Node IDs in the subgraph, shape [num_sub_nodes].
+    
+    Process overview:
+        1) Use nx.convert_node_labels_to_integers to re-index subgraph nodes from 0..(num_sub_nodes-1).
+           The original node ID is stored in subG.nodes[u]['original_label'].
+        2) Build PyG Data:
+            - x: use original_label to index into 'data.x'
+            - edge_index: directly from the re-labeled subG (which is 0..N-1),
+                          but use original_label to find edge_attr in edge_to_idx
+            - edge_attr: from edge_to_idx[(orig_u, orig_v)] or [(orig_v, orig_u)]
     """
-    # List of nodes and edges in the subgraph
-    nodes = list(subgraph.nodes())
-    edges = list(subgraph.edges())
-    
-    # Convert node indices to a PyTorch tensor
-    nodes_tensor = torch.tensor(nodes, dtype=torch.long)
-    
-    # Extract node features for the subgraph from the original data
-    x = data.x[nodes_tensor]  # [num_sub_nodes, feature_dim]
+    import torch
+    import networkx as nx
+    from torch_geometric.data import Data
 
-    # Create a mapping from original node index to subgraph node index
-    mapping = {node: i for i, node in enumerate(nodes)}
-    
-    # Initialize lists to store edge indices and edge attributes for the subgraph
+    # -- 1. 将子图的节点强制重新编号为 0..(N-1),
+    #    同时保留原节点ID在属性 'original_label' 中
+    #    这样 subG 节点的键就是 [0,1,2,...], 不会再出现越界
+    #    label_attribute='original_label' 会在每个节点属性中保存旧ID
+    subG = nx.convert_node_labels_to_integers(
+        subgraph, 
+        first_label=0, 
+        ordering='default',        # 或 'sorted' 都行
+        label_attribute='original_label'
+    )
+    # 现在 subG 的节点编号是 0..(num_sub_nodes-1)
+    # 但 subG.nodes[u]['original_label'] 存的是该节点在原图中的 ID
+
+    # -- 2. 获取子图节点、边
+    nodes = sorted(list(subG.nodes()))           # 这里就是 [0,1,2,..., N-1]
+    edges = list(subG.edges())                   # 形如 [(0,1), (1,2), ...]
+
+    num_sub_nodes = len(nodes)
+    num_sub_edges = len(edges)
+
+    # -- 3. 构造 node 特征 --
+    #    3.1 对每个新节点 u, 找到 original_label 并去 data.x 取特征
+    #        同时统计度数
+    original_ids = []
+    for u in nodes:
+        orig_label = subG.nodes[u]['original_label']  # 原图ID
+        original_ids.append(orig_label)
+    original_ids_tensor = torch.tensor(original_ids, dtype=torch.long)  # [num_sub_nodes]
+
+    # 从 full graph 中提取对应特征
+    x = data.x[original_ids_tensor]  # shape [num_sub_nodes, feature_dim]
+
+    # 计算子图中每个节点的度
+    degrees = torch.tensor([subG.degree(u) for u in nodes], dtype=torch.long)
+    # node_ids 就是当前子图内的“新ID”，即 [0..(N-1)]
+    node_ids = torch.arange(num_sub_nodes, dtype=torch.long)
+
+    # -- 4. 构造 edge_index 和 edge_attr --
     edge_index_list = []
     edge_attrs_list = []
-    
-    # Iterate over each edge in the subgraph
-    for e in edges:
-        u, v = e
-        if (u in mapping) and (v in mapping):
-            # Map original node indices to subgraph node indices
-            edge_index_list.append([mapping[u], mapping[v]])
 
-    # Convert edge indices list to a PyTorch tensor
-    edge_index = torch.tensor(edge_index_list, dtype=torch.long).t().contiguous()  # [2, num_sub_edges]
-    
-    # Compute degrees for each node in the subgraph
-    degrees = torch.tensor([subgraph.degree(n) for n in nodes], dtype=torch.long)  # [num_sub_nodes]
-    
-    # Assign unique node IDs within the subgraph
-    node_ids = torch.arange(len(nodes), dtype=torch.long)  # [num_sub_nodes]
-    
-    # Create a PyG Data object for the subgraph
-    sub_data = Data(
-        x=x,  # Node features, shape [num_sub_nodes, feature_dim]
-        edge_index=edge_index,  # Edge indices, shape [2, num_sub_edges]
-        degree=degrees,  # Node degrees, shape [num_sub_nodes]
-        node_ids=node_ids  # Node IDs, shape [num_sub_nodes]
-    )
-    
-    # Iterate over each edge to assign edge attributes
-    for e in edges:
-        if e in edge_to_idx:
-            idx = edge_to_idx[e]
-        elif (e[1], e[0]) in edge_to_idx:
-            idx = edge_to_idx[(e[1], e[0])]
+    for (u, v) in edges:
+        # u,v 是子图中的 0..N-1, 取出其原图ID
+        orig_u = subG.nodes[u]['original_label']
+        orig_v = subG.nodes[v]['original_label']
+
+        # edge_index 直接用子图的 0..N-1 编号
+        edge_index_list.append([u, v])
+
+        # 在 edge_to_idx 里查找 (orig_u, orig_v) 或 (orig_v, orig_u)
+        if (orig_u, orig_v) in edge_to_idx:
+            idx = edge_to_idx[(orig_u, orig_v)]
+        elif (orig_v, orig_u) in edge_to_idx:
+            idx = edge_to_idx[(orig_v, orig_u)]
         else:
-            idx = -1  # Edge not found in the original mapping
+            idx = -1
         
         if idx != -1:
-            # Append the corresponding edge attributes
-            edge_attrs_list.append(data.edge_attr[idx].tolist())
+            edge_attrs_list.append(data.edge_attr[idx].tolist())  # [dist, speed, jamFactor]
         else:
-            # If edge attributes are missing, append zeros
-            edge_attrs_list.append([0.0, 0.0, 0.0])
+            edge_attrs_list.append([0.0, 0.0, 0.0])               # 默认值
 
-    # Convert edge attributes list to a PyTorch tensor
-    if edge_attrs_list:
-        sub_data.edge_attr = torch.tensor(edge_attrs_list, dtype=torch.float)  # [num_sub_edges, 3]
+    if len(edge_index_list) > 0:
+        edge_index = torch.tensor(edge_index_list, dtype=torch.long).t().contiguous()
+        edge_attr = torch.tensor(edge_attrs_list, dtype=torch.float)
     else:
-        # If no edge attributes, initialize an empty tensor
-        sub_data.edge_attr = torch.empty((0, 3), dtype=torch.float)
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        edge_attr  = torch.empty((0, 3), dtype=torch.float)
 
-    return sub_data  # Return the subgraph as a PyG Data object
+    # -- 5. 组装 PyG Data 对象 --
+    sub_data = Data(
+        x         = x,             # [num_sub_nodes, feature_dim]
+        edge_index= edge_index,    # [2, num_sub_edges]
+        edge_attr = edge_attr,     # [num_sub_edges, 3]
+        degree    = degrees,       # [num_sub_nodes]
+        node_ids  = node_ids       # [num_sub_nodes], local subgraph ID
+    )
 
+    # -- 6. 最后做一次越界检查(保险) --
+    #    如果 scatter 时还报越界, 说明 somewhere else is wrong.
+    if edge_index.numel() > 0:
+        max_idx = edge_index.max().item()
+        if max_idx >= num_sub_nodes:
+            raise ValueError(
+                f"convert_nx_to_pyg: Found edge_index with node {max_idx} "
+                f">= num_sub_nodes={num_sub_nodes}. Possibly data mismatch."
+            )
+    
+    return sub_data
+
+
+
+
+import networkx as nx
+import community as community_louvain
+from tqdm import tqdm
+import torch
+from torch_geometric.data import Data
 
 def split_graph_into_subgraphs_louvain(G, data, num_communities, edge_to_idx):
     """
-    Split a NetworkX graph into subgraphs using the Louvain community detection algorithm.
+    Split a NetworkX graph into subgraphs using the Louvain community detection algorithm,
+    then convert each community subgraph into PyG Data.
+
+    This version explicitly removes any edges whose target node (or source node)
+    is not in the set of community nodes, ensuring we do not keep cross-community edges.
 
     Args:
-        G (networkx.Graph): The original graph to split.
-        data (torch_geometric.data.Data): The original graph data containing node features and edge attributes.
-        num_communities (int): Desired number of communities (subgraphs) to split into.
-        edge_to_idx (dict): Mapping from edge tuples (u, v) to their index in edge_attr.
+        G (networkx.Graph): The original graph.
+        data (torch_geometric.data.Data): The PyG Data for the entire graph,
+                                          containing 'x', 'edge_index', 'edge_attr', etc.
+        num_communities (int): Desired number of communities.
+        edge_to_idx (dict): Mapping from (u, v) or (v, u) in the original graph
+                            to the index in data.edge_attr.
 
     Returns:
-        list of torch_geometric.data.Data: A list of subgraphs in PyG Data format.
-    
+        list of torch_geometric.data.Data:
+            A list of subgraphs in PyG format, one for each community.
+
     Notes:
-        - If the initial number of detected communities exceeds `num_communities`, smaller communities
-          are iteratively merged until the desired number is reached.
-        - Each subgraph is converted into PyG Data format using `convert_nx_to_pyg`.
+        - We use Louvain (community_louvain.best_partition) to find initial communities.
+        - If the number of detected communities > num_communities, we merge smaller ones.
+        - We then build each subgraph by:
+            1) subG = G.subgraph(community_nodes).copy()
+            2) remove edges referencing any node outside 'community_nodes'
+            3) convert subG to PyG Data by 'convert_nx_to_pyg'
+        - This ensures no cross-community edges remain, preventing index-out-of-range errors.
     """
-    # Perform Louvain community detection to partition the graph
+
+    # 1) Perform Louvain community detection
     partition = community_louvain.best_partition(G)
-    
-    # Organize nodes into communities based on the partition
+    # partition[node] = comm_id
+
+    # 2) Group nodes by community ID
     communities = {}
     for node, comm_id in partition.items():
-        communities.setdefault(comm_id, set()).add(node)
-    
-    current_num = len(communities)  # Current number of detected communities
+        if comm_id not in communities:
+            communities[comm_id] = set()
+        communities[comm_id].add(node)
 
-    # Merge smaller communities if there are more communities than desired
+    current_num = len(communities)
+
+    # 3) If we have more communities than desired, merge the smallest ones
     if current_num > num_communities:
-        # Sort communities by size (ascending)
         sorted_communities = sorted(communities.values(), key=lambda x: len(x))
         while len(sorted_communities) > num_communities:
-            # Remove the two smallest communities and merge them
             c1 = sorted_communities.pop(0)
             if not sorted_communities:
                 break
             c2 = sorted_communities.pop(0)
             merged = c1.union(c2)
             sorted_communities.append(merged)
-            # Re-sort the communities after merging
             sorted_communities = sorted(sorted_communities, key=lambda x: len(x))
-        # Update communities with the merged communities
         communities = {i: c for i, c in enumerate(sorted_communities)}
-    elif current_num < num_communities:
-        # If fewer communities are detected than desired, issue a warning
-        print(f"Warning: Detected {current_num} communities, which is fewer than the desired {num_communities}.")
 
-    # Initialize a list to store the resulting subgraphs
+    elif current_num < num_communities:
+        print(f"Warning: Detected {current_num} communities, fewer than desired {num_communities}.")
+
+    # 4) Build subgraphs, convert to PyG Data
+    from utils import convert_nx_to_pyg  # or wherever your function is
     subgraphs = []
-    
-    # Convert each community into a subgraph and then into PyG Data format
     comm_items = list(communities.items())
+
     for comm_id, nodes in tqdm(comm_items, desc="Converting subgraphs", unit="community"):
-        # Extract the subgraph corresponding to the current community
+        # 4.1 Construct subG with only these nodes
         subG = G.subgraph(nodes).copy()
-        # Convert the NetworkX subgraph to PyG Data format
+
+        # 4.2 Explicitly remove edges that reference nodes outside this community
+        #     (in theory subgraph(...) should have done it, but we do it again to be safe)
+        filtered_edges = []
+        for (u, v) in subG.edges():
+            if (u in nodes) and (v in nodes):
+                filtered_edges.append((u, v))
+        subG.clear_edges()  # remove all edges from subG
+        subG.add_edges_from(filtered_edges)
+
+        # 4.3 Convert to PyG Data
         sub_data = convert_nx_to_pyg(subG, data, edge_to_idx)
-        # Append the subgraph to the list
         subgraphs.append(sub_data)
 
-    return subgraphs  # Return the list of subgraphs
+    return subgraphs
 
 
-def load_multiple_graphs(graphs_dir, num_communities=10):
+
+def load_multiple_graphs(graphs_dir, num_communities=10, save_path=None):
     """
     Load multiple JSON graph files from a directory, split each graph into subgraphs
     using the Louvain algorithm, and aggregate all subgraphs into a single list.
@@ -329,7 +400,10 @@ def load_multiple_graphs(graphs_dir, num_communities=10):
         subgraphs = split_graph_into_subgraphs_louvain(G, data, num_communities, edge_to_idx)
         # Add the resulting subgraphs to the aggregate list
         all_subgraphs.extend(subgraphs)
-
+    # save subgraphs
+    if save_path is not None:
+        torch.save(all_subgraphs, save_path)
+        print(f"All subgraphs saved to {save_path}.")
     # Print the total number of loaded graphs and subgraphs
     print(f"Loaded {len(all_files)} JSON graphs, resulting in {len(all_subgraphs)} subgraphs in total.")
     

@@ -1,12 +1,75 @@
-# graph_model.py
+# graph_model_1.py
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 ###################################################
-# 1. Graphormer Modules
+# 1. Graphormer Modules with Edge Attributes
 ###################################################
+
+def safe_scatter_(out: torch.Tensor,
+                  index: torch.Tensor,
+                  src: torch.Tensor,
+                  dim: int = 3) -> torch.Tensor:
+    """
+    A custom 'scatter_' that skips any out-of-range indices instead of throwing an error.
+
+    Args:
+        out (Tensor): The destination tensor, e.g. shape [B, num_heads, N, N].
+        index (Tensor): The indices to scatter into `out`, e.g. shape [B, num_heads, N, E].
+        src (Tensor): The source values, e.g. shape [B, num_heads, 1, E].
+        dim (int): The dimension along which to scatter. Default is 3.
+
+    Returns:
+        Tensor: The updated 'out' tensor, after scattering valid entries.
+    
+    Process:
+        1) We flatten all but the dimension we scatter along, so we can gather
+           the valid positions in one pass.
+        2) We find the subset of positions where 'index' is within the valid range.
+        3) We place 'src' values into 'out' at those positions, skipping any invalid ones.
+    
+    Note:
+        - This function might be slow for large tensors because it does additional
+          masking and advanced indexing. Use at your own risk.
+        - Any index < 0 or >= out.size(dim) is ignored.
+    """
+
+    # Check shapes roughly
+    if out.dim() != index.dim() or out.dim() != src.dim():
+        raise ValueError("safe_scatter_: 'out', 'index', 'src' must have the same number of dimensions.")
+
+    if dim < 0:
+        dim = out.dim() + dim
+
+    # For simplicity, assume the shapes match except at 'dim'
+    # E.g. out.shape == [B, H, N, N]
+    #      index.shape == [B, H, N, E]
+    #      src.shape   == [B, H, 1, E]  (or maybe [B, H, N, E], you can adapt as needed)
+
+    # (1) Identify valid mask: index in [0, out.size(dim))
+    valid_mask = (index >= 0) & (index < out.size(dim))
+    if not valid_mask.any():
+        # No valid entries, nothing to scatter
+        return out
+
+    # (2) Flatten 'index' so we can do advanced indexing
+    # Let's get the coordinates of all valid positions
+    coords = valid_mask.nonzero(as_tuple=False)  # shape [K, out.dim()], K = # of valid entries
+    # coords[i] = [b, h, row, e] if dim=3
+
+    # The actual index value at these coords:
+    index_values = index[coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]]
+    # The corresponding src value:
+    # If your src shape is [B, H, 1, E], then row dimension is always 0 for src
+    # so we do something like:
+    src_values = src[coords[:, 0], coords[:, 1], 0, coords[:, 3]]
+
+    # (3) Scatter manually: out[b, h, row, index_val] = src_val
+    out[coords[:, 0], coords[:, 1], coords[:, 2], index_values] = src_values
+
+    return out
 
 class GraphormerMultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.1):
@@ -41,72 +104,92 @@ class GraphormerMultiHeadAttention(nn.Module):
     def forward(self, x, edge_index=None, edge_attr=None):
         """
         Forward pass for multi-head attention with edge attributes.
+        In this modified version, we remove any edges that reference
+        out-of-range node indices (>= N) to avoid scatter index errors.
 
         Args:
             x (Tensor): Node features, shape [B, N, D], where
                         B = batch size,
                         N = number of nodes,
                         D = embedding dimension.
-            edge_index (Tensor, optional): Edge indices, shape [2, E], where
-                                           E = number of edges.
-            edge_attr (Tensor, optional): Edge attributes, shape [E, 3].
+            edge_index (Tensor, optional): Edge indices, shape [2, E].
+            edge_attr (Tensor, optional): Edge attributes, shape [E, E_dim] (e.g. [E, 3]).
 
         Returns:
             Tensor: Output features after attention, shape [B, N, D].
         """
-        B, N, D = x.shape  # Batch size, number of nodes, embedding dimension
-        Q = self.q_proj(x)  # Queries: [B, N, D]
-        K = self.k_proj(x)  # Keys: [B, N, D]
-        V = self.v_proj(x)  # Values: [B, N, D]
 
-        # Reshape for multi-head attention
+        B, N, D = x.shape  # batch_size, num_nodes, embedding_dim
+        # 1) Linear projections
+        Q = self.q_proj(x)  # [B, N, D]
+        K = self.k_proj(x)  # [B, N, D]
+        V = self.v_proj(x)  # [B, N, D]
+
+        # 2) Reshape for multi-head attention
         Q = Q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, num_heads, N, head_dim]
         K = K.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, num_heads, N, head_dim]
         V = V.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, num_heads, N, head_dim]
 
-        # Compute attention scores
+        # 3) Compute attention scores
         scores = (Q @ K.transpose(-1, -2)) / (self.head_dim ** 0.5)  # [B, num_heads, N, N]
 
+        # 4) If we have edge attributes, add them to scores
         if edge_index is not None and edge_attr is not None:
-            # Compute edge-based attention biases
-            # edge_index: [2, E], edge_attr: [E, 3]
-            E = edge_index.shape[1]  # Number of edges
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            # (A) Remove edges that reference out-of-range nodes
+            #     Suppose edge_index shape = [2, E], with 0-row = src, 1-row = tgt
+            #     We only keep edges where src < N and tgt < N
+            src_nodes = edge_index[0]  # shape [E]
+            tgt_nodes = edge_index[1]  # shape [E]
+            valid_mask = (src_nodes < N) & (tgt_nodes < N)
+            if valid_mask.sum().item() < len(src_nodes):
+                # We are indeed filtering out some edges
+                edge_index = edge_index[:, valid_mask]            # shape [2, E']
+                edge_attr = edge_attr[valid_mask]                # shape [E', E_dim]
 
-            # Project edge attributes to biases per head
-            edge_bias = self.edge_bias_proj(edge_attr)  # [E, num_heads]
+            # (B) Now proceed with attention bias
+            E = edge_index.shape[1]  # number of valid edges
+            # Project edge_attr -> [E, num_heads]
+            edge_bias = self.edge_bias_proj(edge_attr)
+            # Prepare a full matrix to store these biases
+            edge_bias_full = torch.zeros(
+                (B, self.num_heads, N, N), 
+                device=x.device, 
+                dtype=edge_bias.dtype
+            )
+            # Expand edge_bias to shape [B, num_heads, 1, E]
+            edge_bias = edge_bias.unsqueeze(0).expand(B, -1, -1)  # [B, E, num_heads]
+            edge_bias = edge_bias.permute(0, 2, 1)                # [B, num_heads, E]
+            edge_bias = edge_bias.unsqueeze(2)                    # [B, num_heads, 1, E]
 
-            # Initialize a zero tensor for all possible edges
-            # To map edge biases to the correct positions in the attention score matrix
-            # We use scatter to add biases to corresponding positions
-            # Initialize with zeros: [B, num_heads, N, N]
-            edge_bias_full = torch.zeros((B, self.num_heads, N, N), device=x.device)
+            # We'll scatter on dim=3, using tgt_nodes as index
+            tgt_index = tgt_nodes.view(1, 1, 1, E).expand(B, self.num_heads, N, E)
+            edge_bias_full = safe_scatter_(
+                out=edge_bias_full,
+                index=tgt_index,
+                src=edge_bias,
+                dim=3
+            )
 
-            # Expand edge_bias to [B, num_heads, E]
-            edge_bias = edge_bias.unsqueeze(0).expand(B, -1, -1)  # [B, num_heads, E]
 
-            # Scatter the edge biases into the full attention bias tensor
-            # edge_index contains source and target indices
-            # For each edge, add the corresponding bias to scores at (src, tgt)
-            # Note: In PyG, edges are directed; ensure to handle bidirectional edges if necessary
-            edge_src, edge_tgt = edge_index[0], edge_index[1]  # [E], [E]
-            edge_bias_full.scatter_(3, edge_tgt.view(1, 1, 1, E).expand(B, self.num_heads, N, E),
-                                     edge_bias.unsqueeze(2).expand(B, self.num_heads, 1, E))
-            # [B, num_heads, N, N] += [B, num_heads, N, E] -> broadcasts correctly
+            # Add these biases to scores
+            scores = scores + edge_bias_full
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
-            # Add edge biases to the attention scores
-            scores = scores + edge_bias_full  # [B, num_heads, N, N]
-
-        # Apply softmax to get attention probabilities
+        # 5) Softmax over the last dim => attention probabilities
         attn = F.softmax(scores, dim=-1)  # [B, num_heads, N, N]
-        attn = self.attn_drop(attn)        # Apply dropout
+        attn = self.attn_drop(attn)
 
-        # Compute the attention output
+        # 6) Weighted sum over V
         out = attn @ V  # [B, num_heads, N, head_dim]
         out = out.transpose(1, 2).contiguous().view(B, N, D)  # [B, N, D]
 
-        # Final linear projection
+        # 7) Final linear projection
         out = self.out_proj(out)  # [B, N, D]
         return out
+
+
+
 
 
 class GraphormerLayer(nn.Module):

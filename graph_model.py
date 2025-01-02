@@ -16,57 +16,45 @@ def safe_scatter_(out: torch.Tensor,
     A custom 'scatter_' that skips any out-of-range indices instead of throwing an error.
 
     Args:
-        out (Tensor): The destination tensor, e.g. shape [B, num_heads, N, N].
-        index (Tensor): The indices to scatter into `out`, e.g. shape [B, num_heads, N, E].
-        src (Tensor): The source values, e.g. shape [B, num_heads, 1, E].
+        out (Tensor): The destination tensor, e.g., shape [B, num_heads, N, N].
+        index (Tensor): The indices to scatter into `out`, e.g., shape [B, num_heads, N, E].
+        src (Tensor): The source values, e.g., shape [B, num_heads, 1, E].
         dim (int): The dimension along which to scatter. Default is 3.
 
     Returns:
         Tensor: The updated 'out' tensor, after scattering valid entries.
     
     Process:
-        1) We flatten all but the dimension we scatter along, so we can gather
-           the valid positions in one pass.
-        2) We find the subset of positions where 'index' is within the valid range.
-        3) We place 'src' values into 'out' at those positions, skipping any invalid ones.
+        1) Identify valid indices within the range.
+        2) Scatter source values into the output tensor at valid positions.
+        3) Skip any invalid indices to prevent errors.
     
     Note:
-        - This function might be slow for large tensors because it does additional
-          masking and advanced indexing. Use at your own risk.
+        - This function might be slow for large tensors due to masking and advanced indexing.
         - Any index < 0 or >= out.size(dim) is ignored.
     """
 
-    # Check shapes roughly
+    # Validate that all tensors have the same number of dimensions
     if out.dim() != index.dim() or out.dim() != src.dim():
         raise ValueError("safe_scatter_: 'out', 'index', 'src' must have the same number of dimensions.")
 
     if dim < 0:
         dim = out.dim() + dim
 
-    # For simplicity, assume the shapes match except at 'dim'
-    # E.g. out.shape == [B, H, N, N]
-    #      index.shape == [B, H, N, E]
-    #      src.shape   == [B, H, 1, E]  (or maybe [B, H, N, E], you can adapt as needed)
-
-    # (1) Identify valid mask: index in [0, out.size(dim))
+    # Identify valid indices within the specified dimension
     valid_mask = (index >= 0) & (index < out.size(dim))
     if not valid_mask.any():
-        # No valid entries, nothing to scatter
+        # If no valid indices, return the original tensor
         return out
 
-    # (2) Flatten 'index' so we can do advanced indexing
-    # Let's get the coordinates of all valid positions
-    coords = valid_mask.nonzero(as_tuple=False)  # shape [K, out.dim()], K = # of valid entries
-    # coords[i] = [b, h, row, e] if dim=3
+    # Extract coordinates of valid indices
+    coords = valid_mask.nonzero(as_tuple=False)  # Shape: [K, out.dim()]
 
-    # The actual index value at these coords:
+    # Gather valid index values and corresponding source values
     index_values = index[coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]]
-    # The corresponding src value:
-    # If your src shape is [B, H, 1, E], then row dimension is always 0 for src
-    # so we do something like:
     src_values = src[coords[:, 0], coords[:, 1], 0, coords[:, 3]]
 
-    # (3) Scatter manually: out[b, h, row, index_val] = src_val
+    # Scatter the source values into the output tensor
     out[coords[:, 0], coords[:, 1], coords[:, 2], index_values] = src_values
 
     return out
@@ -101,96 +89,99 @@ class GraphormerMultiHeadAttention(nn.Module):
         # Assuming edge_attr has dimension E_dim, here we set E_dim = 3 as per utils.py
         self.edge_bias_proj = nn.Linear(3, num_heads)  # Transform edge attributes to biases per head
 
-    def forward(self, x, edge_index=None, edge_attr=None):
+    def forward(self, x, edge_index=None, edge_attr=None, batch=None):
         """
         Forward pass for multi-head attention with edge attributes.
-        In this modified version, we remove any edges that reference
-        out-of-range node indices (>= N) to avoid scatter index errors.
+        Supports batched graph inputs.
 
         Args:
-            x (Tensor): Node features, shape [B, N, D], where
-                        B = batch size,
-                        N = number of nodes,
+            x (Tensor): Node features, shape [total_nodes, D], where
+                        total_nodes = sum of nodes in all graphs in the batch,
                         D = embedding dimension.
             edge_index (Tensor, optional): Edge indices, shape [2, E].
-            edge_attr (Tensor, optional): Edge attributes, shape [E, E_dim] (e.g. [E, 3]).
+            edge_attr (Tensor, optional): Edge attributes, shape [E, E_dim] (e.g., [E, 3]).
+            batch (Tensor, optional): Batch vector, shape [total_nodes],
+                                      where batch[i] indicates the graph index to which node i belongs.
 
         Returns:
-            Tensor: Output features after attention, shape [B, N, D].
+            Tensor: Output features after attention, shape [total_nodes, D].
         """
 
-        B, N, D = x.shape  # batch_size, num_nodes, embedding_dim
         # 1) Linear projections
-        Q = self.q_proj(x)  # [B, N, D]
-        K = self.k_proj(x)  # [B, N, D]
-        V = self.v_proj(x)  # [B, N, D]
+        Q = self.q_proj(x)  # [total_nodes, D]
+        K = self.k_proj(x)  # [total_nodes, D]
+        V = self.v_proj(x)  # [total_nodes, D]
 
         # 2) Reshape for multi-head attention
-        Q = Q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, num_heads, N, head_dim]
-        K = K.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, num_heads, N, head_dim]
-        V = V.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # [B, num_heads, N, head_dim]
+        # [total_nodes, D] -> [total_nodes, num_heads, head_dim]
+        Q = Q.view(-1, self.num_heads, self.head_dim)
+        K = K.view(-1, self.num_heads, self.head_dim)
+        V = V.view(-1, self.num_heads, self.head_dim)
+
+        # Transpose to [num_heads, total_nodes, head_dim]
+        Q = Q.transpose(0, 1)  # [num_heads, total_nodes, head_dim]
+        K = K.transpose(0, 1)  # [num_heads, total_nodes, head_dim]
+        V = V.transpose(0, 1)  # [num_heads, total_nodes, head_dim]
 
         # 3) Compute attention scores
-        scores = (Q @ K.transpose(-1, -2)) / (self.head_dim ** 0.5)  # [B, num_heads, N, N]
+        # [num_heads, total_nodes, head_dim] @ [num_heads, head_dim, total_nodes] -> [num_heads, total_nodes, total_nodes]
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [num_heads, total_nodes, total_nodes]
 
         # 4) If we have edge attributes, add them to scores
         if edge_index is not None and edge_attr is not None:
-            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-            # (A) Remove edges that reference out-of-range nodes
-            #     Suppose edge_index shape = [2, E], with 0-row = src, 1-row = tgt
-            #     We only keep edges where src < N and tgt < N
-            src_nodes = edge_index[0]  # shape [E]
-            tgt_nodes = edge_index[1]  # shape [E]
-            valid_mask = (src_nodes < N) & (tgt_nodes < N)
-            if valid_mask.sum().item() < len(src_nodes):
-                # We are indeed filtering out some edges
-                edge_index = edge_index[:, valid_mask]            # shape [2, E']
-                edge_attr = edge_attr[valid_mask]                # shape [E', E_dim]
-
-            # (B) Now proceed with attention bias
-            E = edge_index.shape[1]  # number of valid edges
+            E = edge_index.shape[1]  # number of edges
             # Project edge_attr -> [E, num_heads]
-            edge_bias = self.edge_bias_proj(edge_attr)
-            # Prepare a full matrix to store these biases
+            edge_bias = self.edge_bias_proj(edge_attr)  # [E, num_heads]
+            # Transpose to [num_heads, E]
+            edge_bias = edge_bias.transpose(0, 1)  # [num_heads, E]
+
+            # Initialize a tensor to store edge biases
             edge_bias_full = torch.zeros(
-                (B, self.num_heads, N, N), 
-                device=x.device, 
+                (self.num_heads, x.size(0), x.size(0)),
+                device=x.device,
                 dtype=edge_bias.dtype
-            )
-            # Expand edge_bias to shape [B, num_heads, 1, E]
-            edge_bias = edge_bias.unsqueeze(0).expand(B, -1, -1)  # [B, E, num_heads]
-            edge_bias = edge_bias.permute(0, 2, 1)                # [B, num_heads, E]
-            edge_bias = edge_bias.unsqueeze(2)                    # [B, num_heads, 1, E]
+            )  # [num_heads, total_nodes, total_nodes]
 
-            # We'll scatter on dim=3, using tgt_nodes as index
-            tgt_index = tgt_nodes.view(1, 1, 1, E).expand(B, self.num_heads, N, E)
-            edge_bias_full = safe_scatter_(
-                out=edge_bias_full,
-                index=tgt_index,
-                src=edge_bias,
-                dim=3
-            )
+            # Scatter the edge biases into the full tensor
+            for head in range(self.num_heads):
+                # Scatter edge biases into the appropriate positions in the attention scores
+                edge_bias_full[head].index_put_(
+                    (edge_index[0], edge_index[1]),
+                    edge_bias[head],
+                    accumulate=True
+                )
 
+            # Add the edge biases to the attention scores
+            scores = scores + edge_bias_full  # [num_heads, total_nodes, total_nodes]
 
-            # Add these biases to scores
-            scores = scores + edge_bias_full
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        # 5) If batch information is provided, mask attention scores to prevent cross-graph attention
+        if batch is not None:
+            # batch: [total_nodes], each value is the graph index
+            # Create mask where mask[i,j] = 1 if nodes i and j are in the same graph, else 0
+            # Expand to [num_heads, total_nodes, total_nodes]
+            batch = batch.unsqueeze(0).unsqueeze(0)  # [1, 1, total_nodes]
+            batch_i = batch.expand(self.num_heads, -1, -1)  # [num_heads, 1, total_nodes]
+            batch_j = batch.transpose(1, 2).expand(self.num_heads, -1, -1)  # [num_heads, total_nodes, 1]
+            attention_mask = (batch_i == batch_j).float()  # [num_heads, total_nodes, total_nodes]
 
-        # 5) Softmax over the last dim => attention probabilities
-        attn = F.softmax(scores, dim=-1)  # [B, num_heads, N, N]
+            # Set scores to -inf where attention_mask == 0 to mask them out
+            scores = scores.masked_fill(attention_mask == 0, float('-inf'))
+
+        # 6) Softmax over the last dimension to obtain attention probabilities
+        attn = F.softmax(scores, dim=-1)  # [num_heads, total_nodes, total_nodes]
         attn = self.attn_drop(attn)
 
-        # 6) Weighted sum over V
-        out = attn @ V  # [B, num_heads, N, head_dim]
-        out = out.transpose(1, 2).contiguous().view(B, N, D)  # [B, N, D]
+        # 7) Weighted sum over V
+        # [num_heads, total_nodes, total_nodes] @ [num_heads, total_nodes, head_dim] -> [num_heads, total_nodes, head_dim]
+        out = torch.matmul(attn, V)  # [num_heads, total_nodes, head_dim]
 
-        # 7) Final linear projection
-        out = self.out_proj(out)  # [B, N, D]
+        # 8) Transpose and reshape to [total_nodes, embed_dim]
+        out = out.transpose(0, 1).contiguous().view(-1, self.embed_dim)  # [total_nodes, D]
+
+        # 9) Final linear projection
+        out = self.out_proj(out)  # [total_nodes, D]
+
         return out
-
-
-
-
 
 class GraphormerLayer(nn.Module):
     def __init__(self, hidden_dim, num_heads, dropout=0.1):
@@ -213,21 +204,22 @@ class GraphormerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)  # Layer normalization after feed-forward
         self.dropout = nn.Dropout(dropout)      # Dropout layer
 
-    def forward(self, x, edge_index=None, edge_attr=None):
+    def forward(self, x, edge_index=None, edge_attr=None, batch=None):
         """
         Forward pass for a single Graphormer layer.
 
         Args:
-            x (Tensor): Input node features, shape [B, N, D].
+            x (Tensor): Input node features, shape [total_nodes, D].
             edge_index (Tensor, optional): Edge indices, shape [2, E].
             edge_attr (Tensor, optional): Edge attributes, shape [E, 3].
+            batch (Tensor, optional): Batch vector, shape [total_nodes].
 
         Returns:
-            Tensor: Output node features after the layer, shape [B, N, D].
+            Tensor: Output node features after the layer, shape [total_nodes, D].
         """
         # Multi-head attention with residual connection
         h = self.norm1(x)  # Apply layer normalization
-        h = self.attn(h, edge_index=edge_index, edge_attr=edge_attr)  # Apply multi-head attention
+        h = self.attn(h, edge_index=edge_index, edge_attr=edge_attr, batch=batch)  # Apply multi-head attention
         x = x + self.dropout(h)  # Add residual connection and apply dropout
 
         # Feed-forward network with residual connection
@@ -235,8 +227,7 @@ class GraphormerLayer(nn.Module):
         h = self.ffn(h)    # Apply feed-forward network
         x = x + self.dropout(h)  # Add residual connection and apply dropout
 
-        return x  # [B, N, D]
-
+        return x  # [total_nodes, D]
 
 class Graphormer(nn.Module):
     """
@@ -279,48 +270,41 @@ class Graphormer(nn.Module):
         # Final layer normalization
         self.output_norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, x, degree, node_ids, edge_index=None, edge_attr=None):
+    def forward(self, x, degree, node_ids, edge_index=None, edge_attr=None, batch=None):
         """
         Forward pass for the Graphormer encoder.
 
         Args:
-            x (Tensor): Input node features, shape [B, N, input_dim].
-            degree (Tensor): Node degrees, shape [B, N].
-            node_ids (Tensor): Node IDs for positional embedding, shape [B, N].
+            x (Tensor): Input node features, shape [total_nodes, input_dim].
+            degree (Tensor): Node degrees, shape [total_nodes].
+            node_ids (Tensor): Node IDs for positional embedding, shape [total_nodes].
             edge_index (Tensor, optional): Edge indices, shape [2, E].
             edge_attr (Tensor, optional): Edge attributes, shape [E, 3].
+            batch (Tensor, optional): Batch vector, shape [total_nodes].
 
         Returns:
-            Tensor: Hidden node representations, shape [B, N, hidden_dim].
+            Tensor: Hidden node representations, shape [total_nodes, hidden_dim].
         """
-        if x.dim() == 2:  # Handle case where batch size might be missing
-            x = x.unsqueeze(0)            # [1, N, D]
-            degree = degree.unsqueeze(0)  # [1, N]
-            node_ids = node_ids.unsqueeze(0)  # [1, N]
-
-        B, N, _ = x.shape  # Batch size, number of nodes, input dimension
-
         # 1) Project input features to hidden dimensions
-        h = self.input_proj(x)  # [B, N, hidden_dim]
+        h = self.input_proj(x)  # [total_nodes, hidden_dim]
 
         # 2) Add degree embeddings to node features
-        deg_embed = self.degree_embedding(torch.clamp(degree, max=self.max_degree - 1))  # [B, N, hidden_dim]
-        h = h + deg_embed  # [B, N, hidden_dim]
+        deg_embed = self.degree_embedding(torch.clamp(degree, max=self.max_degree - 1))  # [total_nodes, hidden_dim]
+        h = h + deg_embed  # [total_nodes, hidden_dim]
 
         # 3) Add positional embeddings based on node IDs
         node_ids_clamped = torch.clamp(node_ids, max=self.max_nodes - 1)  # Clamp node IDs to max_nodes
-        pos_embed = self.pos_embedding(node_ids_clamped)  # [B, N, hidden_dim]
-        h = h + pos_embed  # [B, N, hidden_dim]
+        pos_embed = self.pos_embedding(node_ids_clamped)  # [total_nodes, hidden_dim]
+        h = h + pos_embed  # [total_nodes, hidden_dim]
 
         # 4) Pass through each Graphormer layer
         for layer in self.layers:
-            h = layer(h, edge_index=edge_index, edge_attr=edge_attr)  # [B, N, hidden_dim]
+            h = layer(h, edge_index=edge_index, edge_attr=edge_attr, batch=batch)  # [total_nodes, hidden_dim]
 
         # 5) Apply final layer normalization
-        h = self.output_norm(h)  # [B, N, hidden_dim]
+        h = self.output_norm(h)  # [total_nodes, hidden_dim]
 
-        return h  # [B, N, hidden_dim]
-
+        return h  # [total_nodes, hidden_dim]
 
 ###################################################
 # 2. Huber-like Loss
@@ -350,7 +334,6 @@ def huber_like_loss(pred, target, delta=1.0):
 
     return (huber_part + linear_part).mean()  # Scalar
 
-
 ###################################################
 # 3. GraphormerJEPA Model with Edge Attributes
 ###################################################
@@ -361,7 +344,7 @@ class GraphormerJEPA(nn.Module):
 
     Supports both:
         - Self-supervised pretraining (pretrain=True): Returns scalar loss.
-        - Downstream node-level supervised prediction (pretrain=False): Returns [B, N] predictions.
+        - Downstream node-level supervised prediction (pretrain=False): Returns [total_nodes] predictions.
     """
     def __init__(self, input_dim, hidden_dim,
                  max_degree=128, max_nodes=50000,
@@ -410,31 +393,42 @@ class GraphormerJEPA(nn.Module):
         Forward pass of the GraphormerJEPA model.
 
         Args:
-            context_batch (Data): PyG Data object for the context subgraph.
-            target_batch (Data): PyG Data object for the target subgraph (only used if pretrain=True).
+            context_batch (torch_geometric.data.Batch): Batch of context subgraphs.
+            target_batch (torch_geometric.data.Batch): Batch of target subgraphs.
             pretrain (bool): Flag indicating whether to perform pretraining.
 
         Returns:
             Tensor:
                 - If pretrain=True: Scalar loss.
-                - If pretrain=False: Node-level predictions, shape [B, N].
+                - If pretrain=False: Node-level predictions, shape [total_nodes].
         """
-        # Encode the context subgraph
+        # Encode the context subgraphs
         context_h = self.context_encoder(
-            context_batch.x, context_batch.degree, context_batch.node_ids,
-            edge_index=context_batch.edge_index, edge_attr=context_batch.edge_attr
-        )  # [B, N_c, hidden_dim]
+            x=context_batch.x,
+            degree=context_batch.degree,
+            node_ids=context_batch.node_ids,
+            edge_index=context_batch.edge_index,
+            edge_attr=context_batch.edge_attr,
+            batch=context_batch.batch
+        )  # [total_context_nodes, hidden_dim]
 
         if pretrain:
-            # Encode the target subgraph
+            # Encode the target subgraphs
             target_h = self.target_encoder(
-                target_batch.x, target_batch.degree, target_batch.node_ids,
-                edge_index=target_batch.edge_index, edge_attr=target_batch.edge_attr
-            )  # [B, N_t, hidden_dim]
+                x=target_batch.x,
+                degree=target_batch.degree,
+                node_ids=target_batch.node_ids,
+                edge_index=target_batch.edge_index,
+                edge_attr=target_batch.edge_attr,
+                batch=target_batch.batch
+            )  # [total_target_nodes, hidden_dim]
 
             # Global average pooling to get graph-level representations
-            context_rep = context_h.mean(dim=1)  # [B, hidden_dim]
-            target_rep = target_h.mean(dim=1)    # [B, hidden_dim]
+            # PyG's global_mean_pool can be used, but since we have batch vectors, average per graph
+            from torch_geometric.nn import global_mean_pool
+
+            context_rep = global_mean_pool(context_h, context_batch.batch)  # [B, hidden_dim]
+            target_rep = global_mean_pool(target_h, target_batch.batch)    # [B, hidden_dim]
 
             # Predict target representations from context representations
             predicted_target = self.predictor(context_rep)  # [B, hidden_dim]
@@ -446,6 +440,7 @@ class GraphormerJEPA(nn.Module):
         else:
             # Downstream node-level supervised prediction
             # Pass the encoded context through the prediction head
-            predicted_scores = self.prediction_head(context_h).squeeze(-1)  # [B, N]
+            predicted_scores = self.prediction_head(context_h).squeeze(-1)  # [total_context_nodes]
 
-            return predicted_scores  # Node-level predictions [B, N]
+            return predicted_scores  # Node-level predictions [total_nodes, ]
+

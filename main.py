@@ -16,20 +16,20 @@ def main():
 
     # ===== 1. Parameter Setup =====
     graphs_dir = "/workspace/GraphJEPA/pre-train/graphs"  # Directory containing multiple JSON graph files
-    num_communities = 50  # Number of communities to split each graph into
+    num_communities = 10  # Number of communities to split each graph into
     ratio = 9  # Context to target subgraph ratio
 
     # Model and training hyperparameters
-    input_dim = 4
-    hidden_dim = 32
-    lr = 1e-3
-    epochs = 5
-    batch_size = 2 
-    num_workers = 4
+    input_dim = 4 # Modify accordingly to the dataset
+    hidden_dim = 128 # 2^n
+    lr = 1e-3 # For fast astringency
+    epochs = 5 # A small number of epochs will do
+    batch_size = 2 # Now supporting multi-batches
+    num_workers = 4 
     max_degree = 128
     max_nodes = 50000
-    num_heads = 2
-    num_layers = 2
+    num_heads = 4 # 2^n
+    num_layers = 4 # 2^n
     dropout = 0.1
     delta = 1.0  # Huber Loss threshold
 

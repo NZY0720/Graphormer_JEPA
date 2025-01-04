@@ -1,9 +1,7 @@
-This work aims to predict EV Charging Stations' location & Load Info based on a designed Graphormer-JEPA by formulating a Graph combining Road and Grid.
+This work aims to construct foundation model for road-power coupling network based on Graphormer-JEPA. The pre-trained model has the ability to enhance baselines' performance on multiple downstream-tasks by fine-tuning.
 
 This shall be the FIRST research on designing Graphormer-JEPA and its application in the Road & Grid field.
 
-Still working on...
+Paper coming soon...
 
 Anyone Interested in this Graphormer-JEPA, please contact me through nzy0720@sjtu.edu.cn...
-
-Future work would be formulating a Temporal-Graph-JEPA.

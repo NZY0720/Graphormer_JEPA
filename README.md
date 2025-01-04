@@ -4,4 +4,6 @@ This shall be the FIRST research on designing Graphormer-JEPA and its applicatio
 
 Paper coming soon...
 
+Plz star to follow this work. Thank you for your recognition.
+
 Anyone Interested in this Graphormer-JEPA, please contact me through nzy0720@sjtu.edu.cn...

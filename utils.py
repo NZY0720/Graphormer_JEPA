@@ -267,12 +267,6 @@ def convert_nx_to_pyg(subgraph, data, edge_to_idx):
     
     return sub_data
 
-import networkx as nx
-import community as community_louvain
-from tqdm import tqdm
-import torch
-from torch_geometric.data import Data
-
 def split_graph_into_subgraphs_louvain(G, data, num_communities, edge_to_idx):
     """
     Split a NetworkX graph into subgraphs using the Louvain community detection algorithm,
@@ -379,7 +373,7 @@ def load_multiple_graphs(graphs_dir, num_communities=10, save_path=None):
         all_subgraphs.extend(subgraphs)
     # Save subgraphs if a save_path is provided
     if save_path is not None:
-        torch.save(all_subgraphs, save_path)
+        torch.save(all_subgraphs, save_path)  # Use default settings for compatibility
         print(f"All subgraphs saved to {save_path}.")
     # Print the total number of loaded graphs and subgraphs
     print(f"Loaded {len(all_files)} JSON graphs, resulting in {len(all_subgraphs)} subgraphs in total.")
@@ -459,6 +453,87 @@ class JEPACommunityDataset(Dataset):
         context_subgraph = self.subgraphs[i].clone()   # Clone to avoid in-place modifications
         target_subgraph = self.subgraphs[j].clone()
         return context_subgraph, target_subgraph  # Return the pair
+
+class MemoryEfficientJEPADataLoader:
+    """
+    Memory-efficient data loader that processes smaller batches based on node count,
+    helping to prevent out-of-memory errors when dealing with variable-sized graphs.
+    """
+    def __init__(self, dataset, batch_size, max_nodes_per_batch=2000, shuffle=True):
+        """
+        Initialize the memory-efficient data loader.
+        
+        Args:
+            dataset (JEPACommunityDataset): Dataset containing context-target graph pairs.
+            batch_size (int): Maximum number of graph pairs in a batch.
+            max_nodes_per_batch (int): Maximum total number of nodes allowed in a batch.
+            shuffle (bool): Whether to shuffle the dataset.
+        """
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.max_nodes_per_batch = max_nodes_per_batch
+        self.shuffle = shuffle
+        self.indices = list(range(len(dataset)))
+        if shuffle:
+            import random
+            random.shuffle(self.indices)
+        
+    def __iter__(self):
+        """
+        Iterator that yields batches of context-target graph pairs.
+        Limits batch size based on total node count to avoid memory issues.
+        
+        Yields:
+            tuple: (context_batch, target_batch) where each is a Batch object 
+                  containing multiple graphs.
+        """
+        from torch_geometric.data import Batch
+        current_batch_contexts = []
+        current_batch_targets = []
+        current_num_nodes = 0
+        
+        for idx in self.indices:
+            context, target = self.dataset[idx]
+            context_nodes = context.x.size(0)
+            target_nodes = target.x.size(0)
+            
+            # If adding this pair would exceed the node limit, yield the current batch
+            if current_num_nodes > 0 and current_num_nodes + context_nodes + target_nodes > self.max_nodes_per_batch:
+                yield (Batch.from_data_list(current_batch_contexts), 
+                       Batch.from_data_list(current_batch_targets))
+                # Reset batch
+                current_batch_contexts = []
+                current_batch_targets = []
+                current_num_nodes = 0
+            
+            # Add to current batch
+            current_batch_contexts.append(context)
+            current_batch_targets.append(target)
+            current_num_nodes += context_nodes + target_nodes
+            
+            # If we've reached batch_size, yield the batch
+            if len(current_batch_contexts) >= self.batch_size:
+                yield (Batch.from_data_list(current_batch_contexts), 
+                       Batch.from_data_list(current_batch_targets))
+                # Reset batch
+                current_batch_contexts = []
+                current_batch_targets = []
+                current_num_nodes = 0
+        
+        # Don't forget to yield the last batch if it's not empty
+        if current_batch_contexts:
+            yield (Batch.from_data_list(current_batch_contexts), 
+                   Batch.from_data_list(current_batch_targets))
+    
+    def __len__(self):
+        """
+        Estimate the number of batches.
+        
+        Returns:
+            int: Estimated number of batches.
+        """
+        # This is an estimate
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 def count_parameters(model):
     """

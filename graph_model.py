@@ -1,4 +1,4 @@
-# graph_model_1.py
+# graph_model.py
 
 import torch
 import torch.nn as nn
@@ -89,6 +89,44 @@ class GraphormerMultiHeadAttention(nn.Module):
         # Assuming edge_attr has dimension E_dim, here we set E_dim = 3 as per utils.py
         self.edge_bias_proj = nn.Linear(3, num_heads)  # Transform edge attributes to biases per head
 
+    def chunked_attention(self, Q, K, V, mask=None, chunk_size=1024):
+        """
+        Process attention in smaller chunks to save memory.
+        
+        Args:
+            Q, K, V: Query, Key, Value tensors [num_heads, total_nodes, head_dim]
+            mask: Optional mask tensor [num_heads, total_nodes, total_nodes]
+            chunk_size: Size of chunks to process
+            
+        Returns:
+            out: Output tensor after attention [num_heads, total_nodes, head_dim]
+        """
+        num_heads, total_nodes, head_dim = Q.shape
+        out = torch.zeros_like(V)  # Initialize output tensor
+        
+        # Process queries in chunks
+        for i in range(0, total_nodes, chunk_size):
+            end_idx = min(i + chunk_size, total_nodes)
+            # Get current chunk of queries
+            q_chunk = Q[:, i:end_idx]  # [num_heads, chunk_size, head_dim]
+            
+            # Compute attention scores for this chunk
+            chunk_scores = torch.matmul(q_chunk, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            
+            # Apply mask if provided
+            if mask is not None:
+                chunk_mask = mask[:, i:end_idx, :]
+                chunk_scores = chunk_scores.masked_fill(chunk_mask == 0, float('-inf'))
+            
+            # Apply softmax and dropout
+            chunk_attn = F.softmax(chunk_scores, dim=-1)  # [num_heads, chunk_size, total_nodes]
+            chunk_attn = self.attn_drop(chunk_attn)
+            
+            # Compute weighted sum
+            out[:, i:end_idx] = torch.matmul(chunk_attn, V)
+        
+        return out
+
     def forward(self, x, edge_index=None, edge_attr=None, batch=None):
         """
         Forward pass for multi-head attention with edge attributes.
@@ -123,11 +161,8 @@ class GraphormerMultiHeadAttention(nn.Module):
         K = K.transpose(0, 1)  # [num_heads, total_nodes, head_dim]
         V = V.transpose(0, 1)  # [num_heads, total_nodes, head_dim]
 
-        # 3) Compute attention scores
-        # [num_heads, total_nodes, head_dim] @ [num_heads, head_dim, total_nodes] -> [num_heads, total_nodes, total_nodes]
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [num_heads, total_nodes, total_nodes]
-
-        # 4) If we have edge attributes, add them to scores
+        # 3) Process edge attributes if available
+        edge_bias_full = None
         if edge_index is not None and edge_attr is not None:
             E = edge_index.shape[1]  # number of edges
             # Project edge_attr -> [E, num_heads]
@@ -151,10 +186,8 @@ class GraphormerMultiHeadAttention(nn.Module):
                     accumulate=True
                 )
 
-            # Add the edge biases to the attention scores
-            scores = scores + edge_bias_full  # [num_heads, total_nodes, total_nodes]
-
-        # 5) If batch information is provided, mask attention scores to prevent cross-graph attention
+        # 4) Create attention mask if batch information is provided
+        attention_mask = None
         if batch is not None:
             # batch: [total_nodes], each value is the graph index
             # Create mask where mask[i,j] = 1 if nodes i and j are in the same graph, else 0
@@ -164,21 +197,18 @@ class GraphormerMultiHeadAttention(nn.Module):
             batch_j = batch.transpose(1, 2).expand(self.num_heads, -1, -1)  # [num_heads, total_nodes, 1]
             attention_mask = (batch_i == batch_j).float()  # [num_heads, total_nodes, total_nodes]
 
-            # Set scores to -inf where attention_mask == 0 to mask them out
-            scores = scores.masked_fill(attention_mask == 0, float('-inf'))
+        # 5) Process attention in memory-efficient chunks
+        # Use the chunked attention implementation instead of the original attention mechanism
+        out = self.chunked_attention(
+            Q, K, V, 
+            mask=(attention_mask if batch is not None else None),
+            chunk_size=1024  # Adjust chunk size based on GPU memory
+        )
 
-        # 6) Softmax over the last dimension to obtain attention probabilities
-        attn = F.softmax(scores, dim=-1)  # [num_heads, total_nodes, total_nodes]
-        attn = self.attn_drop(attn)
-
-        # 7) Weighted sum over V
-        # [num_heads, total_nodes, total_nodes] @ [num_heads, total_nodes, head_dim] -> [num_heads, total_nodes, head_dim]
-        out = torch.matmul(attn, V)  # [num_heads, total_nodes, head_dim]
-
-        # 8) Transpose and reshape to [total_nodes, embed_dim]
+        # 6) Transpose and reshape to [total_nodes, embed_dim]
         out = out.transpose(0, 1).contiguous().view(-1, self.embed_dim)  # [total_nodes, D]
 
-        # 9) Final linear projection
+        # 7) Final linear projection
         out = self.out_proj(out)  # [total_nodes, D]
 
         return out
@@ -443,4 +473,3 @@ class GraphormerJEPA(nn.Module):
             predicted_scores = self.prediction_head(context_h).squeeze(-1)  # [total_context_nodes]
 
             return predicted_scores  # Node-level predictions [total_nodes, ]
-

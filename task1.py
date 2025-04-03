@@ -37,13 +37,11 @@ class TemporalGCN(nn.Module):
         super(TemporalGCN, self).__init__()
         self.use_pretrained = use_pretrained
         self.hidden_dim = hidden_dim
+        self.num_nodes = num_nodes
+        self.output_dim = output_dim
         
-        # GCN Layer
-        self.W = nn.Parameter(torch.FloatTensor(input_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.W.data)
-        
-        # GRU Cells
-        self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        # Register adjacency matrix and create TGCNCell
+        self.tgcn_cell = TGCNCell(hidden_dim, num_nodes)
         
         # Mapping layer (connects to pretrained RPFM if used)
         if use_pretrained:
@@ -56,9 +54,6 @@ class TemporalGCN(nn.Module):
         
         # Output layer for predicting future steps
         self.output_layer = nn.Linear(hidden_dim, output_dim)
-        
-        # Store adjacency matrix
-        self.register_buffer('adj', torch.zeros(num_nodes, num_nodes))
         
         # Will be set during forward pass
         self.pred_steps = None
@@ -76,46 +71,45 @@ class TemporalGCN(nn.Module):
         if self.pred_steps is None:
             self.pred_steps = 15  # Default, will be overridden in training
         
-        # Process each time step of input sequence
-        hidden = None
+        # Ensure adjacency matrix matches the number of nodes
+        if adj.size(0) != num_nodes or adj.size(1) != num_nodes:
+            print(f"Adjusting adjacency matrix from {adj.shape} to match input nodes {num_nodes}")
+            # If adj is larger, take a subset; if smaller, create a new padded one
+            new_adj = torch.zeros((num_nodes, num_nodes), device=adj.device)
+            min_dim = min(adj.size(0), num_nodes)
+            new_adj[:min_dim, :min_dim] = adj[:min_dim, :min_dim]
+            adj = new_adj
+        
+        # Initialize hidden state
+        hidden_state = torch.zeros(batch_size, num_nodes * self.hidden_dim, device=x.device)
+        
+        # Reshape input to [batch_size, seq_len, num_nodes]
+        x_reshaped = x.squeeze(-1)  # Remove the input_dim dimension (assuming it's 1)
+        
+        # Process through TGCN cell for each time step
         for t in range(input_seq_length):
-            # GCN: Get current time step data
-            current_x = x[:, t, :, :]  # [batch_size, num_nodes, input_dim]
-            
-            # GCN Computation: X' = AXW
-            adj_norm = normalize_adj(adj)
-            gcn_out = torch.matmul(current_x, self.W)  # [batch_size, num_nodes, hidden_dim]
-            gcn_out = torch.matmul(adj_norm, gcn_out)  # [batch_size, num_nodes, hidden_dim]
-            
-            # Reshape for GRU: [batch_size * num_nodes, 1, hidden_dim]
-            gcn_out = gcn_out.reshape(batch_size * num_nodes, 1, -1)
-            
-            # Pass through GRU
-            if hidden is None:
-                _, hidden = self.gru(gcn_out)
-            else:
-                _, hidden = self.gru(gcn_out, hidden)
+            # Pass current input and hidden state through TGCN cell
+            _, hidden_state = self.tgcn_cell(x_reshaped[:, t, :], hidden_state, adj)
         
-        # Now hidden contains the final state after processing the entire input sequence
-        # hidden shape: [1, batch_size * num_nodes, hidden_dim]
+        # Reshape hidden state to [batch_size, num_nodes, hidden_dim]
+        last_hidden = hidden_state.view(batch_size, num_nodes, self.hidden_dim)
         
-        # Reshape hidden for further processing
-        last_hidden = hidden.view(batch_size * num_nodes, -1)  # [batch_size * num_nodes, hidden_dim]
+        # Flatten for processing
+        last_hidden_flat = last_hidden.reshape(batch_size * num_nodes, self.hidden_dim)
             
         # RPFM integration if using pretrained model
         if self.use_pretrained:
             # Map to RPFM dimension
-            rpfm_input = self.mapping_layer(last_hidden)
+            rpfm_input = self.mapping_layer(last_hidden_flat)
             
             # This is where pretrained RPFM would process the data
-            # For this implementation, we'll simulate it with the integration layer
             rpfm_output = self.rpfm_integration(rpfm_input)
             
             # Add residual connection
-            last_hidden = last_hidden + rpfm_output
+            last_hidden_flat = last_hidden_flat + rpfm_output
         
         # Expand the last hidden state to generate predictions for each future time step
-        expanded_hidden = last_hidden.unsqueeze(1).expand(-1, self.pred_steps, -1)
+        expanded_hidden = last_hidden_flat.unsqueeze(1).expand(-1, self.pred_steps, -1)
         
         # Output projection
         output = self.output_layer(expanded_hidden)  # [batch_size * num_nodes, pred_steps, output_dim]
@@ -124,6 +118,109 @@ class TemporalGCN(nn.Module):
         output = output.reshape(batch_size, num_nodes, self.pred_steps, -1).permute(0, 2, 1, 3)
             
         return output
+
+
+class TGCNCell(nn.Module):
+    def __init__(self, hidden_dim, num_nodes):
+        super(TGCNCell, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_nodes = num_nodes
+        
+        # Graph convolution weights for computing gates
+        self.weight_xh = nn.Parameter(torch.FloatTensor(1, hidden_dim * 2))
+        self.weight_hh = nn.Parameter(torch.FloatTensor(hidden_dim, hidden_dim * 2))
+        self.bias_gates = nn.Parameter(torch.FloatTensor(hidden_dim * 2))
+        
+        # Graph convolution weights for computing candidate
+        self.weight_xc = nn.Parameter(torch.FloatTensor(1, hidden_dim))
+        self.weight_hc = nn.Parameter(torch.FloatTensor(hidden_dim, hidden_dim))
+        self.bias_candidate = nn.Parameter(torch.FloatTensor(hidden_dim))
+        
+        self.reset_parameters()
+        
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weight_xh)
+        nn.init.xavier_uniform_(self.weight_hh)
+        nn.init.xavier_uniform_(self.weight_xc)
+        nn.init.xavier_uniform_(self.weight_hc)
+        nn.init.constant_(self.bias_gates, 1.0)
+        nn.init.constant_(self.bias_candidate, 0.0)
+        
+    def forward(self, inputs, hidden_state, adj):
+        """
+        inputs: [batch_size, num_nodes]
+        hidden_state: [batch_size, num_nodes * hidden_dim]
+        adj: [num_nodes, num_nodes]
+        """
+        batch_size = inputs.size(0)
+        
+        # Normalize adjacency matrix
+        adj_norm = normalize_adj(adj)
+        
+        # Reshape hidden state to [batch_size, num_nodes, hidden_dim]
+        hidden_reshaped = hidden_state.view(batch_size, self.num_nodes, self.hidden_dim)
+        
+        # Expand inputs to match dimension for inputs contribution
+        inputs_expanded = inputs.unsqueeze(2)  # [batch_size, num_nodes, 1]
+        
+        # Calculate gates (r, u)
+        # First compute X·W_xh
+        x_contribution = torch.matmul(inputs_expanded, self.weight_xh)  # [batch_size, num_nodes, hidden_dim*2]
+        
+        # Then compute H·W_hh
+        h_contribution = torch.matmul(hidden_reshaped, self.weight_hh)  # [batch_size, num_nodes, hidden_dim*2]
+        
+        # Apply graph convolution: A·(X·W_xh + H·W_hh)
+        combined = x_contribution + h_contribution  # [batch_size, num_nodes, hidden_dim*2]
+        gates_inputs = torch.matmul(adj_norm, combined)  # [batch_size, num_nodes, hidden_dim*2]
+        
+        # Add bias and apply sigmoid
+        gates = torch.sigmoid(gates_inputs + self.bias_gates)  # [batch_size, num_nodes, hidden_dim*2]
+        
+        # Split into reset and update gates
+        r, u = torch.split(gates, self.hidden_dim, dim=2)  # Each [batch_size, num_nodes, hidden_dim]
+        
+        # Calculate candidate state
+        # First compute X·W_xc
+        x_c_contribution = torch.matmul(inputs_expanded, self.weight_xc)  # [batch_size, num_nodes, hidden_dim]
+        
+        # Then compute (r⊙H)·W_hc, where ⊙ is element-wise multiplication
+        reset_hidden = r * hidden_reshaped  # [batch_size, num_nodes, hidden_dim]
+        h_c_contribution = torch.matmul(reset_hidden, self.weight_hc)  # [batch_size, num_nodes, hidden_dim]
+        
+        # Apply graph convolution: A·(X·W_xc + (r⊙H)·W_hc)
+        combined_c = x_c_contribution + h_c_contribution  # [batch_size, num_nodes, hidden_dim]
+        candidate_inputs = torch.matmul(adj_norm, combined_c)  # [batch_size, num_nodes, hidden_dim]
+        
+        # Add bias and apply tanh
+        c = torch.tanh(candidate_inputs + self.bias_candidate)  # [batch_size, num_nodes, hidden_dim]
+        
+        # Update hidden state: h = u⊙h + (1-u)⊙c
+        new_hidden = u * hidden_reshaped + (1.0 - u) * c  # [batch_size, num_nodes, hidden_dim]
+        
+        # Reshape back to [batch_size, num_nodes * hidden_dim]
+        new_hidden_flat = new_hidden.reshape(batch_size, self.num_nodes * self.hidden_dim)
+        
+        return new_hidden, new_hidden_flat
+
+
+def normalize_adj(adj):
+    """Normalize adjacency matrix for GCN"""
+    # Make sure adj is square
+    n = min(adj.size(0), adj.size(1))
+    adj = adj[:n, :n]
+    
+    # Add self-connections
+    adj_with_self = adj + torch.eye(n, device=adj.device)
+    
+    # Calculate degree matrix
+    rowsum = adj_with_self.sum(1)
+    d_inv_sqrt = torch.pow(rowsum, -0.5)
+    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
+    d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
+    
+    # Normalized adjacency: D^(-1/2) * A * D^(-1/2)
+    return torch.mm(torch.mm(d_mat_inv_sqrt, adj_with_self), d_mat_inv_sqrt)
 
 class LSTMModel(nn.Module):
     """LSTM Model for time series prediction"""
@@ -267,8 +364,12 @@ class GRUModel(nn.Module):
 
 def normalize_adj(adj):
     """Normalize adjacency matrix for GCN"""
+    # Make sure adj is square by taking the first n×n submatrix
+    n = min(adj.size(0), adj.size(1))
+    adj = adj[:n, :n]
+    
     # Add self-connections
-    adj_with_self = adj + torch.eye(adj.size(0), device=adj.device)
+    adj_with_self = adj + torch.eye(n, device=adj.device)
     
     # Calculate degree matrix
     rowsum = adj_with_self.sum(1)
@@ -285,7 +386,7 @@ def load_data(power_path, adj_path, time_steps=60, prediction_steps=15):
     """
     # Load power data and adjacency matrix
     power_data = pd.read_csv(power_path)
-    adj_matrix = pd.read_csv(adj_path).values
+    adj_matrix = pd.read_csv(adj_path, header=None, index_col=False).values
     
     # Convert adjacency matrix to PyTorch tensor
     adj_matrix = torch.FloatTensor(adj_matrix)
